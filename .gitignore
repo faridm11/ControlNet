@@ -1,7 +1,7 @@
-# Data folders
-data/
-outputs/
-logs/
+# Data folders (top-level only, not src/data/)
+/data/
+/outputs/
+/logs/
 
 # Python cache
 __pycache__/
