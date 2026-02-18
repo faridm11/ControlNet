@@ -6,8 +6,10 @@
 /outputs/checkpoints/
 /outputs/samples/
 /outputs/logs/*.out
+!/outputs/logs/train_phase1_1530706.out
 /outputs/logs/*.err
 /outputs/logs/metrics_*.csv
+!/outputs/logs/metrics_1530706.csv
 /logs/
 
 # Python cache
