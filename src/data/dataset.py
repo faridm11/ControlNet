@@ -25,6 +25,25 @@ else:
     from .transforms import MaskAugmentation, NoAugmentation
     from .. import config
 
+import sys
+from pathlib import Path
+data_prep_dir = Path(__file__).parent.parent.parent / "data_prep"
+if str(data_prep_dir) not in sys.path:
+    sys.path.insert(0, str(data_prep_dir))
+from class_mapping import remap_mask
+
+# Simplified 8-class color palette (replaces 35-class Cityscapes palette)
+PALETTE = torch.tensor([
+    [0, 0, 0],        # 0: background (void, sky, buildings)
+    [128, 64, 128],   # 1: road
+    [244, 35, 232],   # 2: walkable (sidewalk, crosswalk, etc)
+    [220, 20, 60],    # 3: pedestrian
+    [0, 0, 142],      # 4: vehicle
+    [220, 220, 0],    # 5: traffic control
+    [190, 153, 153],  # 6: obstacle
+    [107, 142, 35],   # 7: environment
+], dtype=torch.float32) / 255.0
+
 
 class ControlNetDataset(Dataset):
     """
@@ -86,12 +105,12 @@ class ControlNetDataset(Dataset):
         # Load prompts CSV
         self.data = self._load_prompts_csv()
         
-        # Setup transforms
+        # Setup transforms - use resolution from config, not hardcoded 512
         self.image_transform = T.Compose([
             T.Resize(resolution, interpolation=T.InterpolationMode.BILINEAR),
             T.CenterCrop(resolution),
-            T.ToTensor(),
-            T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])  # RGB to [-1, 1]
+            T.ToTensor(), # Converts to [0, 1], also converts to CxHxW
+            T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])  # RGB to [-1, 1] , VAE requires this normalization for stable training
         ])
         
         self.mask_transform = T.Compose([
@@ -142,41 +161,47 @@ class ControlNetDataset(Dataset):
             - prompt: text string
             - mask_rgb: (3, H, W) float tensor in [0, 1] for ControlNet
         """
-        item = self.data[idx]
-        
-        # Load image
-        image_path = self.images_dir / item['image_name']
-        if not image_path.exists():
-            raise FileNotFoundError(f"Image not found: {image_path}")
-        image = Image.open(image_path).convert('RGB')
-        image = self.image_transform(image)
-        
-        # Load mask
-        mask_path = self.masks_dir / item['mask_name']
-        if not mask_path.exists():
-            raise FileNotFoundError(f"Mask not found: {mask_path}")
-        mask = Image.open(mask_path)
-        mask = self.mask_transform(mask)
-        mask = np.array(mask)
-        
-        # Apply mask augmentation (on-the-fly)
-        mask = self.mask_augmentation(mask)
-        
-        # Convert to tensor
-        mask = torch.from_numpy(mask).long()
-        
-        # Create RGB visualization of mask for ControlNet
-        # Simple grayscale encoding (will be improved later with color mapping)
-        mask_rgb = mask.float() / (config.NUM_CLASSES - 1) if config.NUM_CLASSES > 1 else mask.float()
-        mask_rgb = mask_rgb.unsqueeze(0).repeat(3, 1, 1)  # (3, H, W)
-        
-        return {
-            'image': image,
-            'mask': mask,
-            'prompt': item['prompt'],
-            'mask_rgb': mask_rgb,
-            'image_name': item['image_name'],
-        }
+        try:
+            item = self.data[idx]
+            
+            # Load image
+            image_path = self.images_dir / item['image_name']
+            if not image_path.exists():
+                raise FileNotFoundError(f"Image not found: {image_path}")
+            image = Image.open(image_path).convert('RGB')
+            image = self.image_transform(image)
+            
+            # Load mask
+            mask_path = self.masks_dir / item['mask_name']
+            if not mask_path.exists():
+                raise FileNotFoundError(f"Mask not found: {mask_path}")
+            mask = Image.open(mask_path)
+            mask = self.mask_transform(mask)
+            mask = np.array(mask)
+            
+            # Remap from 35 classes to 8 simplified classes
+            mask = remap_mask(mask)
+            
+            # Apply mask augmentation (on-the-fly)
+            mask = self.mask_augmentation(mask)
+            
+            # Convert to tensor
+            mask = torch.from_numpy(mask).long()
+            
+            # Create RGB visualization of mask for ControlNet using color palette
+            mask_rgb = PALETTE[mask]              # (H, W, 3)
+            mask_rgb = mask_rgb.permute(2, 0, 1)  # (3, H, W)
+            
+            return {
+                'image': image,
+                'mask': mask,
+                'prompt': item['prompt'],
+                'mask_rgb': mask_rgb,
+                'image_name': item['image_name'],
+            }
+        except Exception as e:
+            print(f"[DATASET ERROR] idx={idx}: {e}")
+            raise
 
 
 def create_dataloader(
@@ -228,7 +253,7 @@ def create_dataloader(
 
 def create_train_dataset(resolution: int = 512, **kwargs) -> ControlNetDataset:
     """
-    Create dataset for training with mask augmentation enabled.
+    Create dataset for training with mask augmentation from config.
     Uses data/train/images, data/train/labels, and data/train/prompts/prompts.csv.
     
     Args:
@@ -238,12 +263,27 @@ def create_train_dataset(resolution: int = 512, **kwargs) -> ControlNetDataset:
     Returns:
         ControlNetDataset with augmentation (train data)
     """
+    # Build mask augmentation parameters from config
+    mask_aug_params = {
+        'jitter_prob': config.MASK_JITTER_PROB,
+        'dilate_erode_prob': config.MASK_DILATE_ERODE_PROB,
+        'elastic_prob': config.MASK_ELASTIC_PROB,
+        'occlusion_prob': config.MASK_OCCLUSION_PROB,
+        'jitter_pixels': config.MASK_JITTER_PIXELS,
+        'morph_kernel_size': config.MASK_MORPH_KERNEL_SIZE,
+        'elastic_alpha': config.MASK_ELASTIC_ALPHA,
+        'elastic_sigma': config.MASK_ELASTIC_SIGMA,
+        'occlusion_patches': config.MASK_OCCLUSION_PATCHES,
+        'occlusion_size': config.MASK_OCCLUSION_SIZE,
+    }
+    
     return ControlNetDataset(
         images_dir=config.TRAIN_IMAGES_DIR,
         masks_dir=config.TRAIN_MASKS_DIR,
         prompts_file=config.TRAIN_PROMPTS_FILE,
         resolution=resolution,
-        augment_masks=True,
+        augment_masks=config.USE_MASK_AUGMENTATION,
+        mask_aug_params=mask_aug_params,
         **kwargs
     )
 

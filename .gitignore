@@ -1,6 +1,13 @@
-# Data folders (top-level only, not src/data/)
-/data/
-/outputs/
+# Data folders - exclude images/labels but keep prompts
+/data/train/images/
+/data/train/labels/
+/data/test/images/
+/data/test/labels/
+/outputs/checkpoints/
+/outputs/samples/
+/outputs/logs/*.out
+/outputs/logs/*.err
+/outputs/logs/metrics_*.csv
 /logs/
 
 # Python cache

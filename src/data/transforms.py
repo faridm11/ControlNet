@@ -23,16 +23,16 @@ class MaskAugmentation:
     
     def __init__(
         self,
-        jitter_prob: float = 0.3,
-        dilate_erode_prob: float = 0.4,
-        elastic_prob: float = 0.2,
-        occlusion_prob: float = 0.1,
-        jitter_pixels: int = 2,
-        morph_kernel_size: int = 3,
-        elastic_alpha: float = 10.0,
-        elastic_sigma: float = 3.0,
-        occlusion_patches: int = 5,
-        occlusion_size: int = 20,
+        jitter_prob: float = 0.1,
+        dilate_erode_prob: float = 0.15,
+        elastic_prob: float = 0.05,
+        occlusion_prob: float = 0.05,
+        jitter_pixels: int = 1,
+        morph_kernel_size: int = 2,
+        elastic_alpha: float = 5.0,
+        elastic_sigma: float = 2.0,
+        occlusion_patches: int = 2,
+        occlusion_size: int = 10,
     ):
         """
         Args:
@@ -60,7 +60,10 @@ class MaskAugmentation:
     
     def __call__(self, mask: np.ndarray) -> np.ndarray:
         """
-        Apply augmentations to mask.
+        Apply augmentations to mask with controlled proportion:
+        - 55% no augmentation
+        - 35% one mild distortion
+        - 10% two combined effects
         
         Args:
             mask: (H, W) array with class IDs
@@ -70,21 +73,30 @@ class MaskAugmentation:
         """
         mask = mask.copy()
         
-        # 1. Morphological operations (dilate/erode)
-        if random.random() < self.dilate_erode_prob:
-            mask = self._apply_morphology(mask)
+        # Determine augmentation level
+        rand = random.random()
+        if rand < 0.55:
+            # No augmentation
+            return mask
+        elif rand < 0.90:  # 0.55 + 0.35 = 0.90
+            # Apply ONE randomly selected augmentation
+            num_augs = 1
+        else:
+            # Apply TWO randomly selected augmentations
+            num_augs = 2
         
-        # 2. Elastic deformation
-        if random.random() < self.elastic_prob:
-            mask = self._apply_elastic_transform(mask)
+        # Available augmentations
+        augmentations = [
+            ('morphology', self._apply_morphology),
+            ('elastic', self._apply_elastic_transform),
+            ('jitter', self._apply_boundary_jitter),
+            ('occlusion', self._apply_occlusions),
+        ]
         
-        # 3. Boundary jitter (after elastic to preserve effect)
-        if random.random() < self.jitter_prob:
-            mask = self._apply_boundary_jitter(mask)
-        
-        # 4. Random occlusions
-        if random.random() < self.occlusion_prob:
-            mask = self._apply_occlusions(mask)
+        # Randomly select and apply augmentations
+        selected = random.sample(augmentations, num_augs)
+        for name, aug_func in selected:
+            mask = aug_func(mask)
         
         return mask
     
@@ -100,7 +112,7 @@ class MaskAugmentation:
             class_mask = (mask == cls)
             
             # Randomly choose dilation or erosion
-            if random.random() < 0.5:
+            if random.random() < 1: # Disabled to dilate  for not destroying small objects,may be enabled later to increase diversity
                 # Dilate
                 new_mask = binary_dilation(
                     class_mask,
@@ -134,8 +146,8 @@ class MaskAugmentation:
         boundary_coords = list(zip(*np.where(boundaries)))
         random.shuffle(boundary_coords)
         
-        # Only jitter 25% of boundary pixels to avoid bottleneck
-        for y, x in boundary_coords[::4]:
+        # Only jitter 10% of boundary pixels for subtle effect
+        for y, x in boundary_coords[::10]:
             # Random offset
             dy = random.randint(-self.jitter_pixels, self.jitter_pixels)
             dx = random.randint(-self.jitter_pixels, self.jitter_pixels)

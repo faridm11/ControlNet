@@ -1,0 +1,103 @@
+SAMPLE PROMPTS (first 20)
+================================================================================
+
+[1] Image: image_0.png | Mask: image_0.png
+Prompt: urban street scene, dusk lighting, JPEG compression artifacts, motion blur
+Classes: road, sidewalk, crosswalk, parking area, curb, car, door, wall, stairs, pole, traffic sign, trees and vegetation
+--------------------------------------------------------------------------------
+
+[2] Image: image_1.png | Mask: image_1.png
+Prompt: city pedestrian zone, noon bright sunlight, light fog, ISO 1600
+Classes: road, sidewalk, crosswalk, curb, pole, trees and vegetation
+--------------------------------------------------------------------------------
+
+[3] Image: image_10.png | Mask: image_10.png
+Prompt: suburban sidewalk area in fog, noon bright sunlight, JPEG compression artifacts, rolling shutter skew
+Classes: road, sidewalk, parking area, curb, car, pole, trees and vegetation, terrain
+--------------------------------------------------------------------------------
+
+[4] Image: image_100.png | Mask: image_100.png
+Prompt: commercial district, after rain with wet surfaces, smartphone camera
+Classes: road, sidewalk, parking area, curb, truck, door, stairs, pole, trees and vegetation
+--------------------------------------------------------------------------------
+
+[5] Image: image_101.png | Mask: image_101.png
+Prompt: commercial district, dawn lighting, JPEG compression, shallow depth of field
+Classes: road, sidewalk, crosswalk, parking area, curb, truck, door, wall, stairs, pole, trees and vegetation, terrain
+--------------------------------------------------------------------------------
+
+[6] Image: image_102.png | Mask: image_102.png
+Prompt: night illumination suburban sidewalk area, overcast sky, shallow depth of field
+Classes: road, sidewalk, crosswalk, parking area, curb, stairs, pole, trees and vegetation, terrain
+--------------------------------------------------------------------------------
+
+[7] Image: image_103.png | Mask: image_103.png
+Prompt: residential neighborhood, overcast sky, slight blur, slight chroma noise
+Classes: road, sidewalk, crosswalk, curb, pole, trees and vegetation, terrain
+--------------------------------------------------------------------------------
+
+[8] Image: image_104.png | Mask: image_104.png
+Prompt: residential neighborhood, night illumination, ISO 1600, slight blur
+Classes: road, sidewalk, crosswalk, curb, car, door, wall, pole, traffic sign, trees and vegetation, terrain
+--------------------------------------------------------------------------------
+
+[9] Image: image_105.png | Mask: image_105.png
+Prompt: high ISO noise of city pedestrian zone, evening twilight, wet road surface
+Classes: road, sidewalk, crosswalk, parking area, curb, car, wall, fence, pole, trees and vegetation, terrain
+--------------------------------------------------------------------------------
+
+[10] Image: image_106.png | Mask: image_106.png
+Prompt: midday lighting campus walkway, wet road surface, slight chroma noise, slight blur
+Classes: road, sidewalk, parking area, curb, car, pole, trees and vegetation, terrain
+--------------------------------------------------------------------------------
+
+[11] Image: image_107.png | Mask: image_107.png
+Prompt: urban street scene, light fog, ISO 1600
+Classes: road, sidewalk, parking area, curb, car, trailer, door, wall, pole, trees and vegetation, terrain
+--------------------------------------------------------------------------------
+
+[12] Image: image_108.png | Mask: image_108.png
+Prompt: HDR lighting overcast sky industrial district street, high ISO noise, shallow DOF
+Classes: road, sidewalk, parking area, curb, car, trailer, pole, trees and vegetation, terrain
+--------------------------------------------------------------------------------
+
+[13] Image: image_109.png | Mask: image_109.png
+Prompt: after rain with wet surfaces, intersection area, overcast lighting, high ISO noise
+Classes: road, sidewalk, parking area, curb, car, trailer, pole, trees and vegetation
+--------------------------------------------------------------------------------
+
+[14] Image: image_11.png | Mask: image_11.png
+Prompt: industrial district street, noon bright sunlight, smartphone camera, shallow DOF
+Classes: road, sidewalk, bike lane, curb, cyclist, car, bus, bicycle, wall, pole, traffic sign, trees and vegetation, terrain
+--------------------------------------------------------------------------------
+
+[15] Image: image_110.png | Mask: image_110.png
+Prompt: urban street scene, overcast sky, slight blur, slight chroma noise
+Classes: road, sidewalk, parking area, curb, car, fence, pole, trees and vegetation, terrain
+--------------------------------------------------------------------------------
+
+[16] Image: image_111.png | Mask: image_111.png
+Prompt: residential neighborhood, sunny conditions, clear weather, JPEG compression artifacts
+Classes: road, sidewalk, parking area, curb, car, fence, pole, trees and vegetation
+--------------------------------------------------------------------------------
+
+[17] Image: image_112.png | Mask: image_112.png
+Prompt: midday lighting wet road surface industrial district street, phone photo, motion blur
+Classes: road, sidewalk, parking area, curb, car, door, wall, fence, pole, traffic sign, trees and vegetation, terrain
+--------------------------------------------------------------------------------
+
+[18] Image: image_113.png | Mask: image_113.png
+Prompt: HDR lighting suburban sidewalk area, clear weather, JPEG compression, slight blur
+Classes: road, sidewalk, parking area, curb, car, door, wall, fence, pole, trees and vegetation
+--------------------------------------------------------------------------------
+
+[19] Image: image_114.png | Mask: image_114.png
+Prompt: city pedestrian zone, light rain, slight chroma noise
+Classes: road, sidewalk, parking area, curb, car, wall, fence, pole, traffic sign, trees and vegetation
+--------------------------------------------------------------------------------
+
+[20] Image: image_115.png | Mask: image_115.png
+Prompt: ISO 1600 of campus walkway, overcast lighting, wet road surface
+Classes: road, sidewalk, parking area, curb, car, wall, pole, traffic sign, trees and vegetation, terrain
+--------------------------------------------------------------------------------
+

@@ -84,7 +84,7 @@ def get_output_root(env_var: str = 'DDPM_OUTPUT_ROOT', default: Optional[Path] =
     Priority:
     1. Environment variable (e.g., DDPM_OUTPUT_ROOT)
     2. Provided default path
-    3. PROJECT_ROOT/outputs
+    3. PROJECT_ROOT/outputs (inside DDPM folder)
     
     Args:
         env_var: Environment variable name to check
@@ -93,7 +93,7 @@ def get_output_root(env_var: str = 'DDPM_OUTPUT_ROOT', default: Optional[Path] =
     Returns:
         Path: Absolute path to output directory
     """
-    # Check environment variable
+    # Always use PROJECT_ROOT/outputs unless explicitly overridden
     if env_var in os.environ:
         output_path = Path(os.environ[env_var])
         if not output_path.is_absolute():
@@ -161,7 +161,7 @@ def setup_paths_from_env() -> Dict[str, Path]:
     paths['images_dir'] = paths['data_root'] / 'images'
     paths['prompts_dir'] = paths['data_root'] / 'prompts'
     paths['checkpoint_dir'] = paths['output_root'] / 'checkpoints'
-    paths['log_dir'] = paths['output_root'] / 'logs'
+    paths['log_dir'] = paths['output_root'] / 'logs'  # Now inside outputs/ folder
     
     return paths
 

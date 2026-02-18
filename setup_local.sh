@@ -26,7 +26,7 @@ conda activate controlnet
 
 echo ""
 echo "[3/4] Installing PyTorch with CUDA 12.4 support..."
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124    
 
 echo ""
 echo "[4/4] Installing other dependencies..."
