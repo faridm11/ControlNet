@@ -1,50 +1,60 @@
-# Data folders - exclude images/labels but keep prompts
-/data/train/images/
-/data/train/labels/
-/data/test/images/
-/data/test/labels/
-/outputs/checkpoints/
-/outputs/samples/
-/outputs/logs/*.out
-!/outputs/logs/train_phase1_1530706.out
-/outputs/logs/*.err
-/outputs/logs/metrics_*.csv
-!/outputs/logs/metrics_1530706.csv
-/logs/
+# ── Data ──────────────────────────────────────────────────────────────────────
+data/train/images/
+data/train/labels/
+data/train/prompts/
+data/test/images/
+data/test/labels/
+data/test/prompts/
 
-# Python cache
+# ── Outputs ───────────────────────────────────────────────────────────────────
+outputs/checkpoints/
+outputs/samples/
+outputs/logs/
+outputs/plots/
+
+# ── Experiment tracking ───────────────────────────────────────────────────────
+wandb/
+runs/
+mlruns/
+
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
 
-# Virtual environments
+# ── Virtual environments ──────────────────────────────────────────────────────
 venv/
 env/
 ENV/
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Model checkpoints and cache
+# ── Model weights & cache ─────────────────────────────────────────────────────
 *.pth
 *.ckpt
 *.safetensors
 huggingface_cache/
 
-# OS
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+pyrightconfig.json
+
+# ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Jupyter
+# ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 *.ipynb
 
-# Test outputs
-test_*.py
-debug_*.py
-temp.py
+# ── Temporary / one-off scripts ───────────────────────────────────────────────
+check_dataset_quick.py
+verify_environment.py
+validate_data_pipeline.py
+ENVIRONMENT_SETUP.md
+QUICK_START.md
+SETUP_COMPLETE.md
+conda_packages_list.txt

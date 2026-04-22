@@ -3,10 +3,8 @@ Mask augmentation transforms to avoid perfect-edge bias.
 Applies jitter, dilate/erode, elastic warp, and partial occlusions on-the-fly.
 """
 
-import torch
-import torch.nn.functional as F
 import numpy as np
-from scipy.ndimage import binary_dilation, binary_erosion, distance_transform_edt, map_coordinates, gaussian_filter
+from scipy.ndimage import binary_dilation, binary_erosion, map_coordinates, gaussian_filter
 import random
 
 
@@ -33,6 +31,7 @@ class MaskAugmentation:
         elastic_sigma: float = 2.0,
         occlusion_patches: int = 2,
         occlusion_size: int = 10,
+        max_augs_per_sample: int = 2,
     ):
         """
         Args:
@@ -46,6 +45,7 @@ class MaskAugmentation:
             elastic_sigma: Elastic deformation smoothness
             occlusion_patches: Number of occlusion patches
             occlusion_size: Size of each occlusion patch
+            max_augs_per_sample: Maximum number of augmentations applied to a mask
         """
         self.jitter_prob = jitter_prob
         self.dilate_erode_prob = dilate_erode_prob
@@ -57,13 +57,17 @@ class MaskAugmentation:
         self.elastic_sigma = elastic_sigma
         self.occlusion_patches = occlusion_patches
         self.occlusion_size = occlusion_size
+        self.max_augs_per_sample = max(1, int(max_augs_per_sample))
     
     def __call__(self, mask: np.ndarray) -> np.ndarray:
+    # The reason i used the call method is to make it easy to integrate into a data pipeline, e.g.:
+    # transforms = MaskAugmentation(...)
+    # augmented_mask = transforms(mask)
+    
         """
-        Apply augmentations to mask with controlled proportion:
-        - 55% no augmentation
-        - 35% one mild distortion
-        - 10% two combined effects
+        Apply augmentations based on per-transform probabilities.
+        Probabilities come from config and must be respected exactly, e.g.
+        elastic_prob=0.0 guarantees no elastic transform is applied.
         
         Args:
             mask: (H, W) array with class IDs
@@ -72,38 +76,40 @@ class MaskAugmentation:
             Augmented mask (H, W)
         """
         mask = mask.copy()
-        
-        # Determine augmentation level
-        rand = random.random()
-        if rand < 0.55:
-            # No augmentation
+
+        # Select augmentations independently according to configured probabilities.
+        selected = []
+        if random.random() < self.dilate_erode_prob:
+            selected.append(self._apply_morphology)
+        if random.random() < self.elastic_prob:
+            selected.append(self._apply_elastic_transform)
+        if random.random() < self.jitter_prob:
+            selected.append(self._apply_boundary_jitter)
+        if random.random() < self.occlusion_prob:
+            selected.append(self._apply_occlusions)
+
+        if not selected:
             return mask
-        elif rand < 0.90:  # 0.55 + 0.35 = 0.90
-            # Apply ONE randomly selected augmentation
-            num_augs = 1
-        else:
-            # Apply TWO randomly selected augmentations
-            num_augs = 2
-        
-        # Available augmentations
-        augmentations = [
-            ('morphology', self._apply_morphology),
-            ('elastic', self._apply_elastic_transform),
-            ('jitter', self._apply_boundary_jitter),
-            ('occlusion', self._apply_occlusions),
-        ]
-        
-        # Randomly select and apply augmentations
-        selected = random.sample(augmentations, num_augs)
-        for name, aug_func in selected:
+
+        # Keep distortions controlled when multiple probabilities fire.
+        if len(selected) > self.max_augs_per_sample:
+            selected = random.sample(selected, self.max_augs_per_sample)
+
+        for aug_func in selected:
             mask = aug_func(mask)
         
         return mask
     
     def _apply_morphology(self, mask: np.ndarray) -> np.ndarray:
-        """Apply random dilation or erosion per class."""
+        """
+        Apply random dilation or erosion per class WITHOUT overwriting other classes.
+        This prevents class boundary conflicts.
+        """
         unique_classes = np.unique(mask)
         out = mask.copy()
+        
+        # Store dilated/eroded regions per class to resolve conflicts
+        class_changes = {}
         
         for cls in unique_classes:
             if cls == 0:  # Skip unlabeled
@@ -112,27 +118,47 @@ class MaskAugmentation:
             class_mask = (mask == cls)
             
             # Randomly choose dilation or erosion
-            if random.random() < 1: # Disabled to dilate  for not destroying small objects,may be enabled later to increase diversity
+            if random.random() < 0.5:  # 50% dilate, 50% erode
                 # Dilate
+                # For each class after dilation version.(BUT FOR A SPESFICIC CLASS VERSION)
                 new_mask = binary_dilation(
                     class_mask,
                     structure=np.ones((self.morph_kernel_size, self.morph_kernel_size))
                 )
+                
+                # The expansions shows the pixels that changes after dilation.
+                expansion = new_mask & ~class_mask
+                class_changes[cls] = ('dilate', expansion)
             else:
                 # Erode
                 new_mask = binary_erosion(
                     class_mask,
                     structure=np.ones((self.morph_kernel_size, self.morph_kernel_size))
                 )
-            
-            # Clear old class and write new one
-            out[mask == cls] = 0
-            out[new_mask] = cls
+                # Mark regions to remove
+                erosion = class_mask & ~new_mask
+                class_changes[cls] = ('erode', erosion)
+        
+        # Apply changes: erosions first (make space), then dilations (fill space)
+        # First pass: erosions
+        for cls, (op, region) in class_changes.items():
+            if op == 'erode':
+                out[region] = 0  # Set eroded regions to unlabeled
+        
+        # Second pass: dilations (only into unlabeled regions)
+        for cls, (op, region) in class_changes.items():
+            if op == 'dilate':
+                # Only expand into regions that are now unlabeled
+                valid_expansion = region & (out == 0)
+                out[valid_expansion] = cls
         
         return out
     
     def _apply_boundary_jitter(self, mask: np.ndarray) -> np.ndarray:
-        """Add small random offsets to boundary pixels."""
+        """
+        Add small random offsets to boundary pixels by SWAPPING (not copying).
+        This prevents label duplication and maintains topology.
+        """
         # Find boundary pixels (where neighbors have different class)
         h, w = mask.shape
         boundaries = np.zeros_like(mask, dtype=bool)
@@ -147,6 +173,7 @@ class MaskAugmentation:
         random.shuffle(boundary_coords)
         
         # Only jitter 10% of boundary pixels for subtle effect
+        out = mask.copy()
         for y, x in boundary_coords[::10]:
             # Random offset
             dy = random.randint(-self.jitter_pixels, self.jitter_pixels)
@@ -155,10 +182,12 @@ class MaskAugmentation:
             new_y = np.clip(y + dy, 0, h - 1)
             new_x = np.clip(x + dx, 0, w - 1)
             
-            # Swap values
-            mask[new_y, new_x] = mask[y, x]
+            # SWAP pixels instead of copy to preserve topology
+            tmp = out[new_y, new_x]
+            out[new_y, new_x] = out[y, x]
+            out[y, x] = tmp
         
-        return mask
+        return out
     
     def _apply_elastic_transform(self, mask: np.ndarray) -> np.ndarray:
         """Apply elastic deformation to mask."""
@@ -193,24 +222,23 @@ class MaskAugmentation:
         mask_warped = mask_warped.reshape(h, w)
         
         return mask_warped.astype(mask.dtype)
-    
+
+    # Randomly removes small mask regions.    
     def _apply_occlusions(self, mask: np.ndarray) -> np.ndarray:
         """Add random rectangular occlusions (set to unlabeled)."""
         h, w = mask.shape
-        
+        if h <= self.occlusion_size or w <= self.occlusion_size:
+            return mask
+        out = mask.copy()
+
         for _ in range(self.occlusion_patches):
-            # Random position
             y = random.randint(0, h - self.occlusion_size)
             x = random.randint(0, w - self.occlusion_size)
-            
-            # Random size (up to max)
             patch_h = random.randint(self.occlusion_size // 2, self.occlusion_size)
             patch_w = random.randint(self.occlusion_size // 2, self.occlusion_size)
-            
-            # Set to unlabeled (0)
-            mask[y:y+patch_h, x:x+patch_w] = 0
-        
-        return mask
+            out[y:y+patch_h, x:x+patch_w] = 0
+
+        return out
 
 
 class NoAugmentation:
@@ -218,3 +246,6 @@ class NoAugmentation:
     
     def __call__(self, mask: np.ndarray) -> np.ndarray:
         return mask
+    
+    # we can easily change the MaskAugmentation to NoAugmentation in the data pipeline for validation/testing, e.g.:
+    # transforms = NoAugmentation()

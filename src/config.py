@@ -5,7 +5,7 @@ All hyperparameters and paths defined here for easy HPC job setup.
 
 import os
 from pathlib import Path
-from .utils import setup_paths_from_env, create_directory_structure
+from src.utils import setup_paths_from_env, create_directory_structure
 
 # ============================================================================
 # PROJECT PATHS (Auto-configured for HPC/Local)
@@ -40,8 +40,6 @@ SD_REVISION = "main"
 CONTROLNET_MODEL_ID = "lllyasviel/control_v11p_sd15_seg"  # Pretrained for segmentation
 CONTROLNET_REVISION = "main"
 
-# Model precision (keep fp32 for mixed precision training)
-DTYPE = "fp32"  # Options: "fp32", "fp16", "bf16"
 USE_XFORMERS = True  # Memory efficient attention
 
 # ============================================================================
@@ -50,50 +48,57 @@ USE_XFORMERS = True  # Memory efficient attention
 USE_LORA = True  # Enable LoRA for ControlNet
 
 # ControlNet LoRA (mandatory)
-CONTROLNET_LORA_RANK = 8  # ControlNet LoRA rank (8-16 as per doc)
+CONTROLNET_LORA_RANK = 16
 CONTROLNET_LORA_ALPHA = 16
-CONTROLNET_LORA_DROPOUT = 0.02 # Small dropout to prevent overfitting given small dataset
+CONTROLNET_LORA_DROPOUT = 0.1  # Higher dropout for small dataset (~1k images)
 CONTROLNET_LORA_TARGET_MODULES = [
-    # Attention layers only
     "to_q", "to_k", "to_v", "to_out.0",
+    "conv_in",  # Required: maps new RGB colors → features; 14/35 classes use new colors
 ]
 
-# UNet LoRA Configuration
-UNET_LORA_RANK = 8  # UNet LoRA rank
-UNET_LORA_ALPHA = 8  # UNet LoRA alpha
-UNET_LORA_DROPOUT = 0.0
-UNET_LORA_TARGET_MODULES = ["to_q", "to_k", "to_v", "to_out.0"]
-
-# UNet Selective Unfreezing (replaces LoRA for UNet)
-# Freeze all except late blocks for texture/realism learning
-UNFREEZE_MID_BLOCK = False  # Unfreeze mid_block (optional)
-# Note: up_blocks[-1] always unfrozen for texture learning
+# UNet LoRA — disabled: freeze UNet entirely, only ControlNet LoRA trains (matches HF reference)
+USE_UNET_LORA = False
+UNET_LORA_RANK = 8
+UNET_LORA_ALPHA = 8
+UNET_LORA_DROPOUT = 0.1
+UNET_LORA_TARGET_MODULES = ["to_q", "to_k", "to_v", "to_out.0"]  # Not used if USE_UNET_LORA=False
 
 # ============================================================================
 # TRAINING HYPERPARAMETERS
 # ============================================================================
 # Basic training
-LEARNING_RATE = 1e-5  # Base LR (used for ControlNet LoRA) - reduced for stability
-CONTROLNET_LORA_LR = 1e-5  # ControlNet LoRA learning rate
-UNET_LR = 5e-7  # UNet late blocks learning rate (lower since full blocks, not LoRA)
+CONTROLNET_LORA_LR = 1e-5  # Conservative LR — preserve pretrained ControlNet knowledge
+UNET_LR = 5e-6              # Unused (USE_UNET_LORA=False)
 BATCH_SIZE = 2  # Increase if GPU memory allows
-GRADIENT_ACCUMULATION_STEPS = 8  # Effective batch size = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS = 16
-NUM_EPOCHS = 50
+GRADIENT_ACCUMULATION_STEPS = 4 
+NUM_EPOCHS = 30  # Increased from 25 to see if more training helps
 MAX_TRAIN_STEPS = None  # If set, overrides NUM_EPOCHS
+
+# Text dropout (classifier-free guidance training)
+# 15% of samples get empty prompt "" so the model learns unconditional generation.
+# Required for CFG to work at inference time.
+TEXT_DROPOUT_PROB = 0.15
 
 # Optimizer
 OPTIMIZER = "adamw"  # Options: "adamw", "adam", "sgd" (will use AdamW8bit)
-WEIGHT_DECAY = 0.01
+WEIGHT_DECAY = 1e-5       # Low weight decay — LoRA adapters are near pretrained distribution
+UNET_WEIGHT_DECAY = 1e-5  # Unused (USE_UNET_LORA=False)
 ADAM_BETA1 = 0.9
 ADAM_BETA2 = 0.999
 ADAM_EPSILON = 1e-8
 
 # Learning rate scheduler
-LR_SCHEDULER = "constant_with_warmup"  # Options: "constant", "constant_with_warmup", "cosine", "linear"
-LR_WARMUP_STEPS = 100  # LoRA warmup steps - increased for longer training
+# cosine: ramps up linearly over LR_WARMUP_STEPS, then decays smoothly to ~0 at end
+# of training.  This avoids the cold-start spike (constant hit pretrained weights at
+# full LR immediately) and lets the model converge rather than oscillate at late epochs.
+LR_SCHEDULER = "cosine"
+LR_WARMUP_STEPS = 100  # ~1 epoch (118 steps/epoch) — gentle linear ramp before peak LR
 
-# Mixed precision (models stay FP32, autocast uses FP16 internally)
-MIXED_PRECISION = "fp16"  # Options: "no", "fp16", "bf16"
+# Mixed precision — bf16 preferred on A100:
+#   - 8 exponent bits vs fp16's 5 → no gradient underflow in deep LoRA layers
+#   - Same A100 tensor-core speed as fp16
+#   - No GradScaler needed (bf16 dynamic range matches fp32)
+MIXED_PRECISION = "bf16"  # Options: "no", "fp16", "bf16"
 
 # Gradient settings
 MAX_GRAD_NORM = 1.0
@@ -102,9 +107,13 @@ MAX_GRAD_NORM = 1.0
 # DIFFUSION PARAMETERS
 # ============================================================================
 # Inference/sampling
-NUM_INFERENCE_STEPS = 20  # DDIM steps (20-30 as per doc)
+NUM_INFERENCE_STEPS = 35  # DDIM steps (20-30 as per doc)
 GUIDANCE_SCALE = 6.0  # CFG scale (5-7 as per doc to reduce artifacts)
-CONTROLNET_CONDITIONING_SCALE = 1.35 # 0.8-1.2 as per doc
+CONTROLNET_CONDITIONING_SCALE = 1.0  # Reduced from 1.3 to give model more freedom
+
+# Sample generation (for visualization during training)
+NUM_SAMPLES_TO_GENERATE = 4  # Number of different prompts to visualize (0 to disable)
+NUM_IMAGES_PER_PROMPT = 4  # Variations per prompt
 
 # Noise scheduler
 NOISE_SCHEDULER = "ddpm"  # Options: "ddpm", "ddim", "pndm"
@@ -114,27 +123,28 @@ NOISE_SCHEDULER = "ddpm"  # Options: "ddpm", "ddim", "pndm"
 # ============================================================================
 # Image/Mask settings
 RESOLUTION = 512  # SD 1.5 native resolution
-NUM_CLASSES = 8  # Simplified classes (0-7): background, road, walkable, pedestrian, vehicle, traffic_control, obstacle, environment
+NUM_CLASSES = 35  # All 35 original classes (21 use ADE20K colors, 14 use new unique colors)
 
 # Data loading
-NUM_WORKERS = 0  # Set to 0 to avoid multiprocessing issues
-PREFETCH_FACTOR = 1  # Reduced to save memory
+NUM_WORKERS = 4
+PREFETCH_FACTOR = 2
 PIN_MEMORY = False  # Disabled to save GPU memory
 
 # ============================================================================
 # MASK AUGMENTATION (applied during training only)
 # ============================================================================
-USE_MASK_AUGMENTATION = True  # Enable mask augmentation for training
+USE_MASK_AUGMENTATION = False  # Enable mask augmentation for training
 
-# Augmentation probabilities
-MASK_JITTER_PROB = 0.1
-MASK_DILATE_ERODE_PROB = 0.15
-MASK_ELASTIC_PROB = 0.00  # Disabled due to low data size and potential instability
-MASK_OCCLUSION_PROB = 0.02
+# Augmentation probabilities - DISABLED for now to avoid train/eval mismatch
+# Set to 0.0 but keep parameters so they can be re-enabled later
+MASK_JITTER_PROB = 0.0  # Disabled
+MASK_DILATE_ERODE_PROB = 0.0  # Disabled due to spatial misalignment issues
+MASK_ELASTIC_PROB = 0.0  # Disabled
+MASK_OCCLUSION_PROB = 0.0  # Disabled
     
 # Augmentation parameters
 MASK_JITTER_PIXELS = 1
-MASK_MORPH_KERNEL_SIZE = 2
+MASK_MORPH_KERNEL_SIZE = 2 # Around 1 pixel dilation/erosion (in 512x512) to simulate annotation uncertainty without drastic changes
 MASK_ELASTIC_ALPHA = 5.0
 MASK_ELASTIC_SIGMA = 2.0
 MASK_OCCLUSION_PATCHES = 1
@@ -154,7 +164,7 @@ SEGMENTOR_LOSS_WEIGHT = 0.1  # Lambda (λ) - ramp 0.1 → 0.5 as per doc
 # Logging
 LOG_DIR = _PATHS['log_dir']
 LOGGING_STEPS = 50
-VALIDATION_STEPS = 1000
+VALIDATION_STEPS = 250  # ~2 epochs with 1k images, batch 2, accum 4 (125 steps/epoch)
 SAVE_STEPS = 500
 
 # Wandb (optional)
@@ -163,7 +173,7 @@ WANDB_PROJECT = "controlnet-sidewalk-segmentation"
 WANDB_ENTITY = None  # Your wandb username/team
 
 # Checkpointing
-SAVE_TOTAL_LIMIT = 5 # Keep only last N checkpoints
+SAVE_TOTAL_LIMIT = 0 # Keep only best models (best_run, best_fid, best_miou, best_overall)
 RESUME_FROM_CHECKPOINT = None  # Path to checkpoint to resume from
 
 # ============================================================================
@@ -211,7 +221,8 @@ def print_config():
     print(f"  ControlNet: {CONTROLNET_MODEL_ID}")
     print(f"  Resolution: {RESOLUTION}")
     print(f"\nTraining:")
-    print(f"  Learning Rate: {LEARNING_RATE}")
+    print(f"  ControlNet LR: {CONTROLNET_LORA_LR}")
+    print(f"  UNet LR: {UNET_LR}")
     print(f"  Batch Size: {BATCH_SIZE}")
     print(f"  Gradient Accumulation: {GRADIENT_ACCUMULATION_STEPS}")
     print(f"  Epochs: {NUM_EPOCHS}")

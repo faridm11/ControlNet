@@ -14,32 +14,17 @@ from diffusers import (
     DDIMScheduler,
 )
 from transformers import CLIPTextModel, CLIPTokenizer
-from typing import Optional, Dict, Any
+from typing import Optional
 import os
 
-# Import config from parent package
 from .. import config
-import os
+from ..losses import diffusion_loss
 
 # Try to import PEFT for LoRA
 try:
     from peft import LoraConfig, get_peft_model
-    PEFT_AVAILABLE = True
 except ImportError:
-    PEFT_AVAILABLE = False
-    print("⚠ PEFT not available. LoRA training will be disabled.")
-
-# Color palette for segmentation mask visualization (matches dataset.py)
-PALETTE = torch.tensor([
-    [0, 0, 0],        # 0: background (void, sky, buildings)
-    [128, 64, 128],   # 1: road
-    [244, 35, 232],   # 2: walkable (sidewalk, crosswalk, etc)
-    [220, 20, 60],    # 3: pedestrian
-    [0, 0, 142],      # 4: vehicle
-    [220, 220, 0],    # 5: traffic control
-    [190, 153, 153],  # 6: obstacle
-    [107, 142, 35],   # 7: environment
-], dtype=torch.float32) / 255.0 
+    raise ImportError("PEFT is required for LoRA training. Install it with: pip install peft")
 
 class DiffusionControlNet(nn.Module):
     """
@@ -106,34 +91,15 @@ class DiffusionControlNet(nn.Module):
         )
         print("✓ Tokenizer loaded")
         
-        # 4. Load UNet (Denoising network - selective unfreezing)
+        # 4. Load UNet (Denoising network — fully frozen, LoRA applied below)
         print(f"\n[4/5] Loading UNet from {config.SD_MODEL_ID}...")
         self.unet = UNet2DConditionModel.from_pretrained(
             config.SD_MODEL_ID,
             subfolder="unet"
         )
-        self.unet.to(device=device)  # Keep in FP32 for mixed precision
-        
-        # Freeze entire UNet first
-        self.unet.requires_grad_(False)
-        
-        # Unfreeze only late blocks for texture/realism learning
-        print("  Unfreezing late UNet blocks for texture learning...")
-        
-        # Unfreeze last up_block (texture & realism)
-        for param in self.unet.up_blocks[-1].parameters():
-            param.requires_grad = True
-        print(f"  ✓ Unfroze up_blocks[-1] ({sum(p.numel() for p in self.unet.up_blocks[-1].parameters()):,} params)")
-        
-        # Optionally unfreeze mid_block
-        if config.UNFREEZE_MID_BLOCK:
-            for param in self.unet.mid_block.parameters():
-                param.requires_grad = True
-            print(f"  ✓ Unfroze mid_block ({sum(p.numel() for p in self.unet.mid_block.parameters()):,} params)")
-        
-        unet_trainable = sum(p.numel() for p in self.unet.parameters() if p.requires_grad)
-        print(f"  ✓ Total UNet trainable params: {unet_trainable:,}")
-        print("✓ UNet loaded with selective unfreezing (late blocks only)")
+        self.unet.to(device=device)
+        self.unet.requires_grad_(False)  # Freeze entirely — LoRA adapters added below
+        print("✓ UNet loaded and frozen (LoRA will be applied after ControlNet)")
         
         # 5. Load ControlNet (Segmentation conditioning)
         print(f"\n[5/5] Loading ControlNet from {config.CONTROLNET_MODEL_ID}...")
@@ -149,9 +115,9 @@ class DiffusionControlNet(nn.Module):
         
         self.controlnet.to(device=device)  # Keep in FP32 for mixed precision
         
-        # Apply LoRA to ControlNet if enabled (attention + conv_in)
-        if config.USE_LORA and PEFT_AVAILABLE:
-            print("  Applying LoRA to ControlNet (attention + conv_in)...")
+        # Apply LoRA to ControlNet (attention + conv_in for new color adaptation)
+        if config.USE_LORA:
+            print("  Applying LoRA to ControlNet...")
             controlnet_lora_config = LoraConfig(
                 r=config.CONTROLNET_LORA_RANK,
                 lora_alpha=config.CONTROLNET_LORA_ALPHA,
@@ -160,19 +126,30 @@ class DiffusionControlNet(nn.Module):
                 bias="none",
             )
             self.controlnet = get_peft_model(self.controlnet, controlnet_lora_config)
-            print(f"  ✓ ControlNet LoRA applied (rank={config.CONTROLNET_LORA_RANK}, alpha={config.CONTROLNET_LORA_ALPHA})")
+            print(f"  ✓ ControlNet LoRA (rank={config.CONTROLNET_LORA_RANK}, alpha={config.CONTROLNET_LORA_ALPHA}, dropout={config.CONTROLNET_LORA_DROPOUT})")
         else:
-            self.controlnet.requires_grad_(True)  # Full fine-tuning
-            print("✓ ControlNet will be fine-tuned (no LoRA)")
+            raise ValueError("USE_LORA=False — full ControlNet fine-tuning is not allowed. Set USE_LORA=True in config.")
+
+        # Apply LoRA to UNet (attention layers only — no conv_in, UNet processes latents not colors)
+        if config.USE_UNET_LORA:
+            print("  Applying LoRA to UNet...")
+            unet_lora_config = LoraConfig(
+                r=config.UNET_LORA_RANK,
+                lora_alpha=config.UNET_LORA_ALPHA,
+                target_modules=config.UNET_LORA_TARGET_MODULES,
+                lora_dropout=config.UNET_LORA_DROPOUT,
+                bias="none",
+            )
+            self.unet = get_peft_model(self.unet, unet_lora_config)
+            print(f"  ✓ UNet LoRA (rank={config.UNET_LORA_RANK}, alpha={config.UNET_LORA_ALPHA}, dropout={config.UNET_LORA_DROPOUT})")
+        else:
+            print("✓ UNet remains frozen (USE_UNET_LORA=False)")
         
-        # Enable gradient checkpointing
-        print("\nEnabling gradient checkpointing...")
-        if hasattr(self.controlnet, 'enable_gradient_checkpointing'):
-            self.controlnet.enable_gradient_checkpointing()
-        # Enable for UNet (not wrapped in PEFT)
-        if hasattr(self.unet, 'enable_gradient_checkpointing'):
-            self.unet.enable_gradient_checkpointing()
-        print("✓ Gradient checkpointing enabled")
+        # Gradient checkpointing DISABLED — breaks LoRA gradient flow.
+        # PyTorch checkpoint() skips backward for blocks whose inputs don't require_grad.
+        # With frozen base weights, deeper LoRA layers get zero gradients.
+        # A100 has 40GB and we use ~8GB, so memory is not a concern.
+        print("\nGradient checkpointing: DISABLED (not needed, breaks LoRA grad flow)")
         
         # 6. Load Noise Scheduler
         print("\nLoading noise scheduler...")
@@ -198,11 +175,12 @@ class DiffusionControlNet(nn.Module):
         print(f"\nTotal parameters: {total_params:,}")
         print(f"Trainable parameters: {trainable_params:,}")
         print(f"  - ControlNet LoRA: {controlnet_trainable:,}")
-        print(f"  - UNet (late blocks): {unet_trainable:,}")
+        print(f"  - UNet LoRA: {unet_trainable:,}")
         print(f"Frozen parameters: {total_params - trainable_params:,}")
         print(f"  - VAE: frozen")
         print(f"  - Text Encoder: frozen")
-        print(f"  - UNet (early/mid blocks): frozen")
+        print(f"  - UNet base weights: frozen (only LoRA adapters train)")
+        print(f"  - ControlNet base weights: frozen (only LoRA adapters train)")
         print(f"\nMemory footprint (approx): {total_params * 4 / 1e9:.2f} GB (fp32)")
         print(f"Trainable memory (approx): {trainable_params * 4 / 1e9:.2f} GB (fp32)")
     
@@ -225,11 +203,12 @@ class DiffusionControlNet(nn.Module):
             return_tensors="pt"
         )
         text_input_ids = text_inputs.input_ids.to(self.device)
-        
+
         # Encode
-        with torch.no_grad():
+        # Force fp32 — CLIP text encoder is frozen and sensitive to fp16
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
             text_embeddings = self.text_encoder(text_input_ids)[0]
-        
+
         return text_embeddings
     
     def encode_images(self, images: torch.Tensor):
@@ -242,9 +221,12 @@ class DiffusionControlNet(nn.Module):
         Returns:
             Latents tensor of shape (B, 4, H//8, W//8)
         """
-        with torch.no_grad():
-            latents = self.vae.encode(images).latent_dist.sample()
-            # Scale latents by VAE scaling factor (as per SD implementation)
+        # Force fp32 — VAE is frozen and known to produce artifacts in fp16
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
+            dist = self.vae.encode(images.float()).latent_dist
+            # eval: use mode (deterministic mean) — no stochastic VAE sampling noise
+            # train: sample from the posterior for proper ELBO training signal
+            latents = dist.mode() if not self.training else dist.sample()
             latents = latents * self.vae.config.scaling_factor
         return latents
     
@@ -253,50 +235,37 @@ class DiffusionControlNet(nn.Module):
         Decode latents to images using VAE.
         
         Args:
-            latents: Tensor of shape (B, 4, H//8, W//8)
+            latents: Tensor of shape (B, 4, H//8, W//8) . 3 downsampling so /8
             
         Returns:
             Images tensor of shape (B, C, H, W), range [-1, 1]
         """
         latents = latents / self.vae.config.scaling_factor
-        with torch.no_grad():
-            images = self.vae.decode(latents).sample
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
+            images = self.vae.decode(latents.float()).sample
         return images
     
-    def prepare_mask_conditioning(self, masks: torch.Tensor):
+    def prepare_mask_conditioning(self, mask_rgb: torch.Tensor):
         """
-        Prepare segmentation masks for ControlNet conditioning.
-        Converts class IDs to RGB visualization using color palette.
+        Prepare RGB segmentation masks for ControlNet conditioning.
+        RGB masks already come from dataset with proper ADE20K colors.
         
         Args:
-            masks: Tensor of shape (B, H, W) with class IDs (0-7)
+            mask_rgb: Tensor of shape (B, 3, H, W) with RGB colors, range [0, 1]
             
         Returns:
-            Conditioning tensor of shape (B, 3, H, W), range [-1, 1]
+            Conditioning tensor of shape (B, 3, H, W), range [0, 1]
         """
-        batch_size, height, width = masks.shape
-        
-        # Use color palette to convert class IDs to RGB (matches dataset.py)
-        palette = PALETTE.to(self.device)
-        
-        # Flatten masks for indexing: (B, H, W) -> (B*H*W,)
-        masks_flat = masks.view(-1).long()
-        
-        # Map class IDs to RGB colors: (B*H*W, 3)
-        mask_rgb_flat = palette[masks_flat]
-        
-        # Reshape back to (B, H, W, 3) then permute to (B, 3, H, W)
-        mask_rgb = mask_rgb_flat.view(batch_size, height, width, 3).permute(0, 3, 1, 2)
-        
-        # Normalize to [-1, 1] to match pipeline preprocessing
-        mask_rgb = mask_rgb * 2.0 - 1.0
-        
+        # Return unchanged - pipeline uses [0, 1] range (verified with forward hook in verify_pipeline_actual.py)
+        # Both training and inference use [0, 1]
+
+        # This is checked in the original lllyasviel/ControlNet code. tutorial_dataset.py also uses same logic
         return mask_rgb
     
     def forward(
         self,
         images: torch.Tensor,
-        masks: torch.Tensor,
+        mask_rgb: torch.Tensor,
         prompts: list,
         timesteps: Optional[torch.Tensor] = None,
     ):
@@ -305,7 +274,7 @@ class DiffusionControlNet(nn.Module):
         
         Args:
             images: Ground truth images (B, 3, H, W), range [-1, 1]
-            masks: Segmentation masks (B, H, W) with class IDs
+            mask_rgb: RGB segmentation masks (B, 3, H, W) with ADE20K colors, range [0, 1]
             prompts: List of text prompts
             timesteps: Optional timesteps (if None, will sample random)
             
@@ -316,6 +285,14 @@ class DiffusionControlNet(nn.Module):
             - noise: Ground truth noise
         """
         batch_size = images.shape[0]
+
+        # One-time range check (only on first forward pass)
+        if not hasattr(self, '_ranges_verified'):
+            assert images.min() >= -1.0 and images.max() <= 1.0, \
+                f"Images out of range [-1, 1]: [{images.min():.3f}, {images.max():.3f}]"
+            assert mask_rgb.min() >= 0.0 and mask_rgb.max() <= 1.0, \
+                f"Mask RGB out of range [0, 1]: [{mask_rgb.min():.3f}, {mask_rgb.max():.3f}]"
+            self._ranges_verified = True
         
         # 1. Encode images to latents
         latents = self.encode_images(images)
@@ -327,19 +304,30 @@ class DiffusionControlNet(nn.Module):
         if timesteps is None:
             timesteps = torch.randint(
                 0, self.noise_scheduler.config.num_train_timesteps,
-                (batch_size,), device=self.device
+                (batch_size,), device=images.device
             ).long()
         
         # 4. Add noise to latents
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
         
-        # 5. Encode text prompts
+        # 5. Text dropout for CFG training — 15% of samples get empty prompt.
+        # Required so the model learns unconditional generation, which CFG needs at inference.
+        # Only applied during training (self.training=True), never during validation/inference.
+        if self.training and config.TEXT_DROPOUT_PROB > 0:
+            prompts = [
+                "" if torch.rand(1).item() < config.TEXT_DROPOUT_PROB else p
+                for p in prompts
+            ]
+
         text_embeddings = self.encode_text(prompts)
         
-        # 6. Prepare mask conditioning
-        mask_conditioning = self.prepare_mask_conditioning(masks)
+        # 6. Prepare mask conditioning (normalize RGB to [-1, 1])
+        mask_conditioning = self.prepare_mask_conditioning(mask_rgb)
         
-        # 7. ControlNet forward pass
+        # 7. ControlNet forward pass — no conditioning_scale here.
+        # conditioning_scale is an inference-time knob (controls how strongly the
+        # ControlNet guides the UNet). During training we always want full-strength
+        # residuals (scale=1.0, the diffusers default) so gradients are clean.
         down_block_res_samples, mid_block_res_sample = self.controlnet(
             noisy_latents,
             timesteps,
@@ -357,8 +345,8 @@ class DiffusionControlNet(nn.Module):
             mid_block_additional_residual=mid_block_res_sample,
         ).sample
         
-        # 9. Compute loss (MSE between predicted and true noise)
-        loss = torch.nn.functional.mse_loss(noise_pred, noise, reduction="mean")
+        # 9. Compute loss
+        loss = diffusion_loss(noise_pred, noise)
         
         return {
             "loss": loss,
@@ -367,59 +355,53 @@ class DiffusionControlNet(nn.Module):
         }
     
     def get_trainable_parameters(self):
-        """Get all trainable parameters (ControlNet only - UNet frozen)."""
-        return self.controlnet.parameters()
+        """Get all trainable parameters (ControlNet LoRA + UNet LoRA adapters)."""
+        return filter(lambda p: p.requires_grad, self.parameters())
     
     def save_checkpoint(self, save_path: str):
-        """Save model checkpoint."""
+        """Save LoRA-only checkpoint (~5MB, not the full 5GB model)."""
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        
-        checkpoint = {
-            "unet": self.unet.state_dict(),
-            "controlnet": self.controlnet.state_dict(),
+        lora_state = {
+            "controlnet_lora": {k: v for k, v in self.controlnet.state_dict().items() if "lora_" in k},
         }
-        torch.save(checkpoint, save_path)
-        print(f"✓ Checkpoint saved to {save_path}")
-    
+        if config.USE_UNET_LORA:
+            lora_state["unet_lora"] = {k: v for k, v in self.unet.state_dict().items() if "lora_" in k}
+        torch.save(lora_state, save_path)
+        print(f"✓ LoRA checkpoint saved to {save_path}")
+
     def load_checkpoint(self, checkpoint_path: str):
-        """Load model checkpoint."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        self.unet.load_state_dict(checkpoint["unet"])
-        self.controlnet.load_state_dict(checkpoint["controlnet"])
-        print(f"✓ Checkpoint loaded from {checkpoint_path}")
+        """Load LoRA-only checkpoint back into the already-initialized model."""
+        lora_state = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        # Merge LoRA keys into current state dict (base weights stay unchanged)
+        cn_state = self.controlnet.state_dict()
+        cn_state.update(lora_state["controlnet_lora"])
+        self.controlnet.load_state_dict(cn_state)
+        if config.USE_UNET_LORA and "unet_lora" in lora_state:
+            unet_state = self.unet.state_dict()
+            unet_state.update(lora_state["unet_lora"])
+            self.unet.load_state_dict(unet_state)
+        print(f"✓ LoRA checkpoint loaded from {checkpoint_path}")
 
 
 def create_pipeline(model: DiffusionControlNet, device: str = None):
     """
     Create inference pipeline from trained model.
-    
+    Called once after training is complete — merges LoRA weights in-place.
+    Do NOT call this more than once (merge_and_unload is destructive).
+
     Args:
         model: Trained DiffusionControlNet model
         device: Device to run pipeline on (None = auto-detect)
-        
+
     Returns:
         StableDiffusionControlNetPipeline for inference
     """
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # Unwrap PEFT models - pipeline needs raw ControlNetModel
-    controlnet = model.controlnet
-    unet = model.unet
-    
-    if hasattr(controlnet, 'get_base_model'):
-        print("Unwrapping PEFT ControlNet for pipeline...")
-        controlnet = controlnet.get_base_model()
-    
-    if hasattr(unet, 'get_base_model'):
-        print("Unwrapping PEFT UNet for pipeline...")
-        unet = unet.get_base_model()
-    
-    print("CONTROLNET TYPE:", type(controlnet))
-    # The LoRA is not applied to UNet yet,but if it were, we would need to unwrap it as well.
-    print("UNET TYPE:", type(unet))
-    
+
+    controlnet = model.controlnet.merge_and_unload()
+    unet = model.unet.merge_and_unload() if hasattr(model.unet, 'merge_and_unload') else model.unet
+
     pipeline = StableDiffusionControlNetPipeline(
         vae=model.vae,
         text_encoder=model.text_encoder,
@@ -427,8 +409,9 @@ def create_pipeline(model: DiffusionControlNet, device: str = None):
         unet=unet,
         controlnet=controlnet,
         scheduler=DDIMScheduler.from_pretrained(config.SD_MODEL_ID, subfolder="scheduler"),
-        safety_checker=None,  # Disable safety checker
+        safety_checker=None,
         feature_extractor=None,
     )
     pipeline.to(device)
     return pipeline
+

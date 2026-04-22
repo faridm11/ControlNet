@@ -2,20 +2,23 @@
 PyTorch Dataset for ControlNet training with segmentation masks and text prompts.
 """
 
-import os
+import sys
 import csv
 import torch
 import numpy as np
 from PIL import Image
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 from torch.utils.data import Dataset
 import torchvision.transforms as T
 
+# data_prep lives outside the src package tree — register it once so all imports below work
+_data_prep_dir = Path(__file__).parent.parent.parent / "data_prep"
+if str(_data_prep_dir) not in sys.path:
+    sys.path.insert(0, str(_data_prep_dir))
+
 # Handle both direct execution and module import
 if __name__ == "__main__":
-    import sys
-    from pathlib import Path
     sensation_root = Path(__file__).parent.parent.parent.parent
     if str(sensation_root) not in sys.path:
         sys.path.insert(0, str(sensation_root))
@@ -25,24 +28,14 @@ else:
     from .transforms import MaskAugmentation, NoAugmentation
     from .. import config
 
-import sys
-from pathlib import Path
-data_prep_dir = Path(__file__).parent.parent.parent / "data_prep"
-if str(data_prep_dir) not in sys.path:
-    sys.path.insert(0, str(data_prep_dir))
-from class_mapping import remap_mask
+from class_mapping import COLOR_PALETTE, NUM_CLASSES
 
-# Simplified 8-class color palette (replaces 35-class Cityscapes palette)
-PALETTE = torch.tensor([
-    [0, 0, 0],        # 0: background (void, sky, buildings)
-    [128, 64, 128],   # 1: road
-    [244, 35, 232],   # 2: walkable (sidewalk, crosswalk, etc)
-    [220, 20, 60],    # 3: pedestrian
-    [0, 0, 142],      # 4: vehicle
-    [220, 220, 0],    # 5: traffic control
-    [190, 153, 153],  # 6: obstacle
-    [107, 142, 35],   # 7: environment
-], dtype=torch.float32) / 255.0
+# Build palette tensor from class_mapping.py — single source of truth for all colors.
+# Shape: (35, 3), values in [0, 1].
+PALETTE = torch.tensor(
+    [COLOR_PALETTE[i] for i in range(NUM_CLASSES)],
+    dtype=torch.float32
+) / 255.0
 
 
 class ControlNetDataset(Dataset):
@@ -164,32 +157,51 @@ class ControlNetDataset(Dataset):
         try:
             item = self.data[idx]
             
-            # Load image
+            # Load image and mask
             image_path = self.images_dir / item['image_name']
             if not image_path.exists():
                 raise FileNotFoundError(f"Image not found: {image_path}")
             image = Image.open(image_path).convert('RGB')
-            image = self.image_transform(image)
             
-            # Load mask
             mask_path = self.masks_dir / item['mask_name']
             if not mask_path.exists():
                 raise FileNotFoundError(f"Mask not found: {mask_path}")
             mask = Image.open(mask_path)
+            
+            # Get original size to ensure same transforms
+            orig_size = image.size  # (W, H)
+            
+            # Mask and image must have identical dimensions — misalignment is a data bug
+            if mask.size != orig_size:
+                raise ValueError(
+                    f"Mask/image size mismatch for {item['image_name']}: "
+                    f"image={orig_size}, mask={mask.size}"
+                )
+            
+            # Convert mask to numpy for augmentation at NATIVE resolution
+            mask_np = np.array(mask)
+            
+            # Apply mask augmentation BEFORE resizing (cleaner, no interpolation artifacts)
+            mask_np = self.mask_augmentation(mask_np)
+            
+            # Convert back to PIL
+            mask = Image.fromarray(mask_np.astype(np.uint8))
+            
+            # Apply transforms TOGETHER to ensure spatial alignment
+            # Both get same resize scale and crop region
+            image = self.image_transform(image)
             mask = self.mask_transform(mask)
+            
+            # Convert mask to numpy
             mask = np.array(mask)
-            
-            # Remap from 35 classes to 8 simplified classes
-            mask = remap_mask(mask)
-            
-            # Apply mask augmentation (on-the-fly)
-            mask = self.mask_augmentation(mask)
-            
+
             # Convert to tensor
             mask = torch.from_numpy(mask).long()
             
             # Create RGB visualization of mask for ControlNet using color palette
-            mask_rgb = PALETTE[mask]              # (H, W, 3)
+            # PALETTE stays on CPU (DataLoader workers are CPU-only)
+            # Transfer to GPU happens in training loop for efficiency
+            mask_rgb = PALETTE[mask]  # (H, W, 3)
             mask_rgb = mask_rgb.permute(2, 0, 1)  # (3, H, W)
             
             return {
@@ -206,47 +218,43 @@ class ControlNetDataset(Dataset):
 
 def create_dataloader(
     dataset: Dataset,
-    batch_size: int = 1,
+    batch_size: int = config.BATCH_SIZE,
     shuffle: bool = True,
-    num_workers: int = 4,
+    num_workers: int = config.NUM_WORKERS,
     pin_memory: bool = True,
 ) -> torch.utils.data.DataLoader:
     """
     Create DataLoader with proper collate function.
-    
+
     Args:
         dataset: ControlNetDataset instance
         batch_size: Batch size
         shuffle: Whether to shuffle
-        num_workers: Number of worker processes
+        num_workers: Number of worker processes (default: config.NUM_WORKERS)
         pin_memory: Pin memory for faster GPU transfer
-        
+
     Returns:
         DataLoader
     """
-    
+
     def collate_fn(batch):
         """Custom collate to handle prompts (strings)."""
-        images = torch.stack([item['image'] for item in batch])
-        masks = torch.stack([item['mask'] for item in batch])
-        prompts = [item['prompt'] for item in batch]
-        mask_rgbs = torch.stack([item['mask_rgb'] for item in batch])
-        image_names = [item['image_name'] for item in batch]
-        
         return {
-            'image': images,
-            'mask': masks,
-            'prompt': prompts,
-            'mask_rgb': mask_rgbs,
-            'image_name': image_names,
+            'image':      torch.stack([item['image']    for item in batch]),
+            'mask':       torch.stack([item['mask']     for item in batch]),
+            'mask_rgb':   torch.stack([item['mask_rgb'] for item in batch]),
+            'prompt':     [item['prompt']     for item in batch],
+            'image_name': [item['image_name'] for item in batch],
         }
-    
+
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        prefetch_factor=config.PREFETCH_FACTOR if num_workers > 0 else None,
+        persistent_workers=False,  # Disabled: causes deadlocks between epochs on HPC/SLURM
         collate_fn=collate_fn,
     )
 
@@ -313,7 +321,6 @@ def create_val_dataset(resolution: int = 512, **kwargs) -> ControlNetDataset:
 if __name__ == "__main__":
     """Test dataset loading."""
     print("Testing ControlNetDataset...")
-    print()
     
     # Create train dataset
     dataset = ControlNetDataset(

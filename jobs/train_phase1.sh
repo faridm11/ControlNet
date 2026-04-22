@@ -29,7 +29,7 @@ module load python/3.12-conda
 module load cuda/12.4.1
 
 # Activate conda environment (conda init already done in .bashrc)
-conda activate controlnet
+conda activate control2
 
 # Verify environment
 echo ""
@@ -46,7 +46,6 @@ export DDPM_OUTPUT_ROOT=/home/woody/iwi5/iwi5388h/SENSATION/DDPM/outputs
 export HF_HOME=$WORK/huggingface_cache
 
 # Set Hugging Face cache
-export TRANSFORMERS_CACHE=$HF_HOME
 export HF_DATASETS_CACHE=$HF_HOME
 
 # Disable progress bars in logs
@@ -57,9 +56,10 @@ export HF_HUB_DISABLE_PROGRESS_BARS=1
 export PYTHONPATH=/home/woody/iwi5/iwi5388h/SENSATION/DDPM:$PYTHONPATH
 
 # Create output directories
-mkdir -p $DDPM_OUTPUT_ROOT
+mkdir -p $DDPM_OUTPUT_ROOT/checkpoints
+mkdir -p $DDPM_OUTPUT_ROOT/logs
+mkdir -p $DDPM_OUTPUT_ROOT/samples
 mkdir -p $HF_HOME
-mkdir -p /home/woody/iwi5/iwi5388h/SENSATION/DDPM/logs
 
 # Print configuration
 echo "========================================================================"
@@ -78,6 +78,9 @@ cd /home/woody/iwi5/iwi5388h/SENSATION/DDPM
 find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 
+# Clear stale bytecode
+find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
 # Run training
 echo ""
 echo "Starting training..."
@@ -85,8 +88,10 @@ echo "========================================================================"
 
 python -m src.train
 
-# Training finished
+EXIT_CODE=$?
+
 echo ""
 echo "========================================================================"
-echo "Job finished at: $(date)"
+echo "Job finished at: $(date) | Exit code: $EXIT_CODE"
 echo "========================================================================"
+exit $EXIT_CODE
