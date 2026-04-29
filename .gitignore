@@ -1,16 +1,15 @@
 # ── Data ──────────────────────────────────────────────────────────────────────
 data/train/images/
 data/train/labels/
-data/train/prompts/
 data/test/images/
 data/test/labels/
-data/test/prompts/
 
 # ── Outputs ───────────────────────────────────────────────────────────────────
 outputs/checkpoints/
 outputs/samples/
 outputs/logs/
 outputs/plots/
+test/outputs/
 
 # ── Experiment tracking ───────────────────────────────────────────────────────
 wandb/

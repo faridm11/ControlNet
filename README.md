@@ -25,33 +25,37 @@ DDPM/
 │   ├── config.py                     # All hyperparameters and paths
 │   ├── losses.py                     # Diffusion MSE loss (Phase 1), seg loss (Phase 2)
 │   ├── plotting.py                   # Loss / FID / grad norm curve plots
-│   ├── sampling.py                   # Sample image grids during/after training
+│   ├── sampling.py                   # Sample image grids after training
 │   ├── evaluation.py                 # FID + mIoU evaluation
 │   ├── models/
 │   │   └── diffusion_controlnet.py   # Full model wrapper (VAE, CLIP, UNet, ControlNet)
-│   └── data/
-│       ├── dataset.py                # ControlNetDataset, DataLoader, train/val helpers
-│       └── transforms.py             # Mask augmentation (jitter, morph, elastic, occlusion)
+│   ├── data/
+│   │   ├── dataset.py                # ControlNetDataset, DataLoader, train/val helpers
+│   │   └── transforms.py             # Mask augmentation (jitter, morph, elastic, occlusion)
+│   └── testing/
+│       ├── overfit_8_samples.py      # Overfit sanity check (8 samples, 200 epochs)
+│       └── overfit_rtx3080.sh        # SLURM job for overfit test (A100)
 ├── data_prep/
 │   ├── class_mapping.py              # 35-class color palette — single source of truth
 │   ├── generate_prompts.py           # Auto-generate prompts from mask class statistics
 │   └── prompt_templates.py           # Prompt templates per scene type
 ├── data/
 │   ├── train/
-│   │   ├── images/                   # ~950 RGB training images
-│   │   ├── labels/                   # Segmentation masks (PNG, color-coded by class)
-│   │   └── prompts/prompts.csv
+│   │   ├── images/                   # ~950 RGB training images (not in git)
+│   │   ├── labels/                   # Segmentation masks (not in git)
+│   │   └── prompts/prompts.csv       # Pre-generated text prompts
 │   └── test/
-│       ├── images/                   # ~50 RGB validation images
-│       ├── labels/
+│       ├── images/                   # ~50 RGB validation images (not in git)
+│       ├── labels/                   # (not in git)
 │       └── prompts/prompts.csv
 ├── jobs/
 │   └── train_phase1.sh               # SLURM job script (A100 partition, 8h)
+├── inference.py                      # Standalone inference script
 └── outputs/
-    ├── checkpoints/                  # LoRA weights — saved only on val loss improvement
+    ├── checkpoints/                  # <jobid>_LoRA.pt + <jobid>_Full/ saved here
     ├── logs/                         # metrics CSV + SLURM .out / .err files
-    ├── samples/                      # Generated image grids per epoch
-    └── plots/                        # PNG plots (loss, FID, grad norm)
+    ├── samples/                      # Generated image grids (end of training)
+    └── plots/                        # PNG plots (loss, grad norm)
 ```
 
 ---
@@ -75,7 +79,7 @@ DDPM/
 | Nature | vegetation, earth, sky, field |
 | Void | unlabeled, dynamic_void, static_void, unclear_void |
 
-**Color palette:** 21 classes reuse the original ADE20K colors (the pretrained ControlNet already understands these). 14 classes use new unique colors chosen to be visually distinct from all ADE20K entries. All colors are defined in `data_prep/class_mapping.py` and loaded by the dataset at runtime — this is the single source of truth.
+**Color palette:** 21 classes reuse original ADE20K colors (pretrained ControlNet already understands these). 14 classes use new unique colors chosen to be visually distinct from all ADE20K entries. All colors defined in `data_prep/class_mapping.py` — single source of truth.
 
 ---
 
@@ -90,15 +94,15 @@ Standard DDPM epsilon-prediction loss: MSE between the noise predicted by the UN
 | Parameter | Value | Notes |
 |---|---|---|
 | LoRA rank / alpha | 16 / 16 | Scale = alpha/rank = 1.0 |
-| LoRA target modules | `to_q, to_k, to_v, to_out.0, conv_in` | 
+| LoRA target modules | `to_q, to_k, to_v, to_out.0, controlnet_cond_embedding.conv_in` | `conv_in` targets only the conditioning input, not the latent input |
 | LoRA dropout | 0.1 | Regularization for small dataset |
 | Learning rate | 1e-5 | Conservative — keeps LoRA adapters close to pretrained init |
-| LR schedule | Cosine + 100 warmup steps | Linear ramp avoids full-LR cold-start spike |
+| LR schedule | Cosine + 100 warmup steps | Linear ramp avoids cold-start spike |
 | Batch size | 2 × 4 grad accum = 8 effective | A100 memory budget |
 | Epochs | 30 | ~3540 optimizer steps total |
 | Mixed precision | bf16 | A100 native; no GradScaler needed |
-| Text dropout | 15% | Classifier-free guidance training — empty prompt for unconditional branch |
-| UNet | Fully frozen | Avoids the moving-target problem; matches HF ControlNet reference |
+| Text dropout | 15% | Classifier-free guidance training |
+| UNet | Fully frozen | Avoids moving-target problem; matches HF reference |
 
 ### Phase 2 — Segmentation consistency loss (planned)
 
@@ -109,17 +113,19 @@ Adds a frozen segmentor in the loop: generate an image from the mask, run the se
 ## Running on HPC (SLURM)
 
 ```bash
-# Submit job
+# Submit full training job (A100, 8h)
 sbatch jobs/train_phase1.sh
 
 # Monitor live
 tail -f outputs/logs/train_phase1_<JOB_ID>.out
+
+# Overfit sanity check (8 samples, 200 epochs — verifies gradient flow)
+sbatch src/testing/overfit_rtx3080.sh
 ```
 
 The job script sets `DDPM_DATA_ROOT` and `DDPM_OUTPUT_ROOT`. Paths resolve automatically in `src/config.py` via `setup_paths_from_env()` — no code changes needed between local and HPC runs.
 
-
-### Running locally (RTX GPU)
+### Running locally
 
 ```bash
 conda activate control2
@@ -128,27 +134,44 @@ export DDPM_OUTPUT_ROOT=$(pwd)/outputs
 python -m src.train
 ```
 
-For an RTX 4050 (6 GB), reduce memory usage in `src/config.py`:
-```python
-BATCH_SIZE = 1
-GRADIENT_ACCUMULATION_STEPS = 2
-```
-
 ---
 
 ## Outputs
 
-**Per epoch:**
+**Per epoch (during training):**
 - `outputs/logs/metrics_<JOB_ID>.csv` — step, epoch, train_loss, val_loss, lr, grad_norm
-- `outputs/plots/loss_curve.png` — smoothed train loss + val loss
-- `outputs/plots/grad_norm_curve.png` — average gradient norm over epochs
+- `outputs/plots/loss_curve.png` — smoothed train + val loss
+- `outputs/plots/grad_norm_curve.png` — gradient norm over epochs
 
 **On val loss improvement:**
-- `outputs/checkpoints/best_val_model.pt` — LoRA-only weights (~5 MB, not the full 5 GB model)
+- `outputs/checkpoints/<JOB_ID>_LoRA.pt` — LoRA adapters only (~5 MB); reloadable on top of any base model
 
-**After training:**
-- `outputs/samples/` — generated image grids (mask | generated | reference)
-- FID score printed to log
+**After training completes:**
+- `outputs/checkpoints/<JOB_ID>_Full/` — merged ControlNet (~1.4 GB); load directly without LoRA
+- `outputs/samples/` — generated image grids (mask | generated images)
+
+---
+
+## Inference
+
+```bash
+# From merged checkpoint (recommended)
+python inference.py \
+    --controlnet outputs/checkpoints/1581867_Full \
+    --mask data/test/labels/image_128.png \
+    --prompt "urban sidewalk with trees and parked cars" \
+    --output results/image_128.png
+
+# From LoRA checkpoint
+python inference.py \
+    --lora outputs/checkpoints/1581867_LoRA.pt \
+    --mask data/test/labels/image_128.png \
+    --prompt "urban sidewalk with trees and parked cars"
+```
+
+Options: `--num-images`, `--steps`, `--guidance`, `--control-strength`, `--seed`
+
+Saves a side-by-side grid (mask | gen_0 | gen_1 | ...) plus individual images.
 
 ---
 
@@ -156,9 +179,17 @@ GRADIENT_ACCUMULATION_STEPS = 2
 
 | Metric | What it measures |
 |---|---|
-| Train MSE loss | Noise prediction error — training signal only |
-| Val MSE loss | Same metric on held-out set; expect natural epoch-to-epoch fluctuation (±0.01) since timesteps are sampled randomly |
-| FID | Fréchet Inception Distance between generated and real images (lower = better) |
+| Train MSE loss | Noise prediction error — training signal |
+| Val MSE loss | Same on held-out set; expect ±0.01 fluctuation per epoch (random timestep sampling) |
+| FID | Fréchet Inception Distance — unreliable below ~2048 images; use visual inspection instead |
 | mIoU | Segmentor accuracy on generated images vs. input mask (Phase 2 only) |
 
+---
 
+## Environment
+
+```bash
+conda activate control2
+# See requirements.txt or environment.yml for full package list
+# Key: torch, diffusers, transformers, peft, torchvision, scipy, torchmetrics
+```

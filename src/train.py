@@ -328,6 +328,7 @@ class Trainer:
 
         print("\nBuilding pipeline + running final evaluation...")
         self._build_pipeline()
+        self.save_merged_controlnet()
         final_results = self.evaluate_full(control_strengths=[config.CONTROLNET_CONDITIONING_SCALE])
         print(f"FID: {final_results['best_fid']:.2f}")
         print(f"mIoU: {final_results['best_miou']:.4f} (placeholder)")
@@ -422,11 +423,11 @@ class Trainer:
         self.model.train()
 
     def save_checkpoint(self, is_best_val: bool = False):
-        """Save LoRA-only checkpoint when val loss improves (~5MB, not 5GB)."""
+        """Save LoRA-only checkpoint when val loss improves (~5MB)."""
         if not is_best_val:
             return
 
-        best_val_path = config.CHECKPOINT_DIR / "best_val_model.pt"
+        lora_path = config.CHECKPOINT_DIR / f"{self.run_id}_LoRA.pt"
         checkpoint = {
             'controlnet_lora': {k: v for k, v in self.model.controlnet.state_dict().items() if 'lora_' in k},
             'optimizer': self.optimizer.state_dict(),
@@ -437,8 +438,15 @@ class Trainer:
         }
         if config.USE_UNET_LORA:
             checkpoint['unet_lora'] = {k: v for k, v in self.model.unet.state_dict().items() if 'lora_' in k}
-        torch.save(checkpoint, best_val_path)
-        print(f"★ BEST VAL MODEL saved (val_loss={self.best_val_loss:.4f}): {best_val_path}")
+        torch.save(checkpoint, lora_path)
+        print(f"★ BEST VAL MODEL saved (val_loss={self.best_val_loss:.4f}): {lora_path}")
+
+    def save_merged_controlnet(self):
+        """Save merged ControlNet (base + LoRA baked in) after merge_and_unload(). ~1.4GB."""
+        merged_path = config.CHECKPOINT_DIR / f"{self.run_id}_Full"
+        merged_path.mkdir(parents=True, exist_ok=True)
+        self.pipeline.controlnet.save_pretrained(merged_path)
+        print(f"★ MERGED CONTROLNET saved: {merged_path}")
 
 
 def main():

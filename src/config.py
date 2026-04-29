@@ -53,7 +53,7 @@ CONTROLNET_LORA_ALPHA = 16
 CONTROLNET_LORA_DROPOUT = 0.1  # Higher dropout for small dataset (~1k images)
 CONTROLNET_LORA_TARGET_MODULES = [
     "to_q", "to_k", "to_v", "to_out.0",
-    "conv_in",  # Required: maps new RGB colors → features; 14/35 classes use new colors
+    "controlnet_cond_embedding.conv_in",  # Maps new RGB colors → features; 14/35 classes use new colors
 ]
 
 # UNet LoRA — disabled: freeze UNet entirely, only ControlNet LoRA trains (matches HF reference)
@@ -67,6 +67,7 @@ UNET_LORA_TARGET_MODULES = ["to_q", "to_k", "to_v", "to_out.0"]  # Not used if U
 # TRAINING HYPERPARAMETERS
 # ============================================================================
 # Basic training
+
 CONTROLNET_LORA_LR = 1e-5  # Conservative LR — preserve pretrained ControlNet knowledge
 UNET_LR = 5e-6              # Unused (USE_UNET_LORA=False)
 BATCH_SIZE = 2  # Increase if GPU memory allows
@@ -131,7 +132,7 @@ PREFETCH_FACTOR = 2
 PIN_MEMORY = False  # Disabled to save GPU memory
 
 # ============================================================================
-# MASK AUGMENTATION (applied during training only)
+# MASK AUGMENTATION 
 # ============================================================================
 USE_MASK_AUGMENTATION = False  # Enable mask augmentation for training
 

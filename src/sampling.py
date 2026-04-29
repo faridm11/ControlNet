@@ -199,7 +199,7 @@ def _run_standalone():
     print(f"Device: {device}")
     print(f"Loading checkpoint: {args.checkpoint}")
 
-    model = DiffusionControlNet(pretrained=False, device=device)
+    model = DiffusionControlNet(pretrained=True, device=device)
     model.load_checkpoint(args.checkpoint)
     model.eval()
 
