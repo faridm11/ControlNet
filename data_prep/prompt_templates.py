@@ -143,10 +143,10 @@ CLASS_PROMPT_NAMES = {
     25: "street pole",
     26: "sign",
     27: "traffic light",
-    28: "vegetation",
+    28: "trees",          # palette uses ADE20K tree color — "trees" matches pretrained prior
     29: None,           # earth — too generic, skip
     30: None,           # sky — skip
-    31: None,           # field — skip
+    31: None,           # void_ground — void, skip
     32: None,           # dynamic_void — void, skip
     33: None,           # static_void — void, skip
     34: None,           # unclear_void — void, skip

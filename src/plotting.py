@@ -36,21 +36,26 @@ def _smooth(values: list, window: int = 20) -> list:
     return pad + smoothed.tolist()
 
 
-def plot_training_curves(metrics_csv_path: str | Path, output_dir: str | Path) -> None:
+def plot_training_curves(metrics_csv_path: str | Path, output_dir: str | Path,
+                         run_id: str = "") -> None:
     """
     Read the training metrics CSV and save loss + FID plots as PNGs.
 
     The CSV has columns:
         step, epoch, train_loss, val_loss, miou, fid, control_strength, lr
 
-    Two files are produced in output_dir/plots/:
-        loss_curve.png  — smoothed train loss + val loss over training steps
-        fid_curve.png   — FID score per epoch (when available)
+    Files are produced in output_dir/plots/, prefixed with run_id so multiple
+    runs don't overwrite each other:
+        <run_id>_loss_curve.png       — smoothed train loss + val loss over steps
+        <run_id>_fid_curve.png        — FID score per epoch (when available)
+        <run_id>_grad_norm_curve.png  — gradient norm per epoch
 
     Args:
         metrics_csv_path: Path to the metrics CSV file
         output_dir: Root output directory (plots/ subfolder will be created)
+        run_id: Run identifier prefixed to every output filename (e.g. SLURM job id)
     """
+    prefix = f"{run_id}_" if run_id else ""
     if not MATPLOTLIB_AVAILABLE:
         print("matplotlib not available — skipping plot generation")
         return
@@ -63,7 +68,12 @@ def plot_training_curves(metrics_csv_path: str | Path, output_dir: str | Path) -
     # -------------------------------------------------------------------------
     # Parse CSV
     # -------------------------------------------------------------------------
-    steps, epochs, train_losses, val_losses, fid_values, grad_norms = [], [], [], [], [], []
+    steps, epochs, train_losses, val_losses = [], [], [], []
+    fid_values, kid_values, lpips_values, grad_norms = [], [], [], []
+
+    def _opt(row, key):
+        raw = row.get(key, "").strip()
+        return float(raw) if raw else None
 
     with open(metrics_csv_path) as f:
         header = f.readline().strip().split(",")
@@ -77,10 +87,10 @@ def plot_training_curves(metrics_csv_path: str | Path, output_dir: str | Path) -
                 epochs.append(int(row["epoch"]))
                 train_losses.append(float(row["train_loss"]))
                 val_losses.append(float(row["val_loss"]))
-                fid_raw = row.get("fid", "").strip()
-                fid_values.append(float(fid_raw) if fid_raw else None)
-                gn_raw = row.get("grad_norm", "").strip()
-                grad_norms.append(float(gn_raw) if gn_raw else None)
+                fid_values.append(_opt(row, "fid"))
+                kid_values.append(_opt(row, "kid"))
+                lpips_values.append(_opt(row, "lpips"))
+                grad_norms.append(_opt(row, "grad_norm"))
             except (ValueError, KeyError):
                 continue
 
@@ -109,7 +119,7 @@ def plot_training_curves(metrics_csv_path: str | Path, output_dir: str | Path) -
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    loss_path = plots_dir / "loss_curve.png"
+    loss_path = plots_dir / f"{prefix}loss_curve.png"
     fig.savefig(loss_path, dpi=150)
     plt.close(fig)
     print(f"Saved: {loss_path}")
@@ -129,12 +139,38 @@ def plot_training_curves(metrics_csv_path: str | Path, output_dir: str | Path) -
         ax.legend()
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        fid_path = plots_dir / "fid_curve.png"
+        fid_path = plots_dir / f"{prefix}fid_curve.png"
         fig.savefig(fid_path, dpi=150)
         plt.close(fig)
         print(f"Saved: {fid_path}")
     else:
         print("No FID values in CSV — skipping FID plot")
+
+    # -------------------------------------------------------------------------
+    # Plot 2b/2c: KID and LPIPS per epoch (the reliable small-sample metrics)
+    # -------------------------------------------------------------------------
+    def _plot_epoch_metric(values, fname, ylabel, title, color, lower_better=True):
+        pairs = [(e, v) for e, v in zip(epochs, values) if v is not None]
+        if not pairs:
+            return
+        xs, ys = zip(*pairs)
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(xs, ys, color=color, linewidth=1.5, marker="o", markersize=4, label=ylabel)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel + (" (lower is better)" if lower_better else " (higher is better)"))
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        path = plots_dir / fname
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"Saved: {path}")
+
+    _plot_epoch_metric(kid_values, f"{prefix}kid_curve.png", "KID",
+                       "KID Over Training (unbiased — trust over FID at n=50)", "purple")
+    _plot_epoch_metric(lpips_values, f"{prefix}lpips_curve.png", "LPIPS vs GT",
+                       "LPIPS to Ground-Truth Over Training", "teal")
 
     # -------------------------------------------------------------------------
     # Plot 3: Gradient norm per epoch
@@ -151,7 +187,7 @@ def plot_training_curves(metrics_csv_path: str | Path, output_dir: str | Path) -
         ax.legend()
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        gn_path = plots_dir / "grad_norm_curve.png"
+        gn_path = plots_dir / f"{prefix}grad_norm_curve.png"
         fig.savefig(gn_path, dpi=150)
         plt.close(fig)
         print(f"Saved: {gn_path}")

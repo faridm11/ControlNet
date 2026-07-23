@@ -1,7 +1,12 @@
 """
-Class mapping for sidewalk segmentation dataset.
-All 35 original classes preserved with unique colors.
-21 classes use ADE20K colors (pretrained), 14 classes use new unique colors.
+Class mapping for sidewalk segmentation dataset (segments/sidewalk-semantic, 35 classes, IDs 0-34).
+Source: https://huggingface.co/datasets/segments/sidewalk-semantic
+
+Palette strategy:
+- 21 classes reuse ADE20K colors so the pretrained ControlNet seg weights apply directly.
+- 13 classes use new unique colors (chosen far from ADE20K to avoid confusion).
+- 5 void/unknown classes (0, 31-34) all use white (255,255,255) — one neutral color
+  so the model fills those regions from context rather than learning spurious content.
 """
 
 # Number of classes (0-34 = 35 total)
@@ -40,7 +45,7 @@ CLASS_NAMES = {
     28: "vegetation",
     29: "earth",
     30: "sky",
-    31: "field",
+    31: "void_ground",
     32: "dynamic_void",
     33: "static_void",
     34: "unclear_void",
@@ -49,7 +54,8 @@ CLASS_NAMES = {
 # ============================================================================
 # COLOR PALETTE (35 classes total)
 # 21 classes use ADE20K colors (pretrained knowledge)
-# 14 classes use NEW unique colors (far from ADE20K to avoid confusion)
+# 13 classes use NEW unique colors (far from ADE20K to avoid confusion)
+#  5 void classes (0, 31-34) use white (255,255,255) — neutral/context-fill
 # ============================================================================
 
 COLOR_PALETTE = {
@@ -85,7 +91,7 @@ COLOR_PALETTE = {
     20: (120, 120, 120),  # wall (ADE20K)
     21: (255, 184, 6),    # fence (ADE20K)    
     22: (255, 82, 0),     # bridge (ADE20K)
-    23: (90, 90, 90),     # tunnel - NEW COLOR
+    23: (80, 100, 130),   # tunnel - NEW COLOR (blue-gray, distinct from wall/vegetation)
     24: (255, 224, 0),    # stairs (ADE20K)
     
     # Objects - all ADE20K
@@ -93,17 +99,19 @@ COLOR_PALETTE = {
     26: (255, 5, 153),    # sign (ADE20K)
     27: (41, 0, 255),     # traffic_light (ADE20K)
     
-    # Nature - 28-30 are ADE20K, 31 is NEW
-    28: (204, 255, 4),    # vegetation (ADE20K)
+    # Nature - all ADE20K
+    28: (4, 200, 3),      # vegetation — ADE20K tree color (stronger prior than plant for outdoor scenes)
     29: (120, 120, 70),   # earth (ADE20K)
     30: (6, 230, 230),    # sky (ADE20K)
-    31: (170, 255, 120),  # field - NEW COLOR
-    
-    # Other voids - 32 is NEW, 33-34 same as 0
-    32: (30, 30, 30),     # dynamic_void - NEW COLOR
-    33: (255, 255, 255),  # static_void (same as unlabeled) 
-    # these are ignored during control training(255, 255, 255)
-    34: (255, 255, 255),  # unclear_void (same as unlabeled)
+
+    # Void classes - all white so the model fills from context, not spurious content
+    31: (255, 255, 255),  # void_ground  (dataset: void-ground)
+    32: (255, 255, 255),  # dynamic_void (dataset: void-dynamic)
+    33: (255, 255, 255),  # static_void  (dataset: void-static)
+    34: (255, 255, 255),  # unclear_void (dataset: void-unclear)
 }
 
-
+# IDs to ignore in segmentation loss (Phase 2) and mIoU evaluation.
+# These classes have no reliable ground-truth content — penalizing them
+# would add noise to the semantic consistency signal.
+VOID_CLASS_IDS = {0, 31, 32, 33, 34}

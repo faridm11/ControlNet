@@ -63,7 +63,7 @@ echo "STARTING OVERFIT-8 RUN"
 echo "========================================================================"
 echo ""
 
-python -m src.testing.overfit_8_samples --num-samples 8 --epochs 200 --batch-size 2 --accum-steps 1
+python -m src.testing.overfit_8_samples --num-samples 2 --epochs 2000 --batch-size 2 --accum-steps 1
 
 EXIT_CODE=$?
 
