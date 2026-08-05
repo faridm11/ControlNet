@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=controlnet_a100
-#SBATCH --output=/home/woody/iwi5/iwi5388h/SENSATION/DDPM/outputs/logs/train_phase1_%j.out
-#SBATCH --error=/home/woody/iwi5/iwi5388h/SENSATION/DDPM/outputs/logs/train_phase1_%j.err
+#SBATCH --output=outputs/logs/train_phase1_%j.out
+#SBATCH --error=outputs/logs/train_phase1_%j.err
 #SBATCH --time=08:00:00
 #SBATCH --partition=a100
 #SBATCH --gres=gpu:a100:1
@@ -40,9 +40,13 @@ echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available()
 echo "GPU: $(python -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None")')"
 echo ""
 
+# SLURM_SUBMIT_DIR is always set by SLURM to the directory where sbatch was called.
+# Submit from DDPM/: sbatch jobs/train_phase1.sh
+DDPM_ROOT="$SLURM_SUBMIT_DIR"
+
 # Set environment variables for paths
-export DDPM_DATA_ROOT=/home/woody/iwi5/iwi5388h/SENSATION/DDPM/data
-export DDPM_OUTPUT_ROOT=/home/woody/iwi5/iwi5388h/SENSATION/DDPM/outputs
+export DDPM_DATA_ROOT=$DDPM_ROOT/data
+export DDPM_OUTPUT_ROOT=$DDPM_ROOT/outputs
 export HF_HOME=$WORK/huggingface_cache
 
 # Set Hugging Face cache
@@ -53,7 +57,7 @@ export TRANSFORMERS_VERBOSITY=error
 export HF_HUB_DISABLE_PROGRESS_BARS=1
 
 # Set PYTHONPATH
-export PYTHONPATH=/home/woody/iwi5/iwi5388h/SENSATION/DDPM:$PYTHONPATH
+export PYTHONPATH=$DDPM_ROOT:$PYTHONPATH
 
 # Create output directories
 mkdir -p $DDPM_OUTPUT_ROOT/checkpoints
@@ -72,14 +76,11 @@ echo "PYTHONPATH: $PYTHONPATH"
 echo "========================================================================"
 
 # Navigate to project directory
-cd /home/woody/iwi5/iwi5388h/SENSATION/DDPM
+cd "$DDPM_ROOT"
 
 # Clear Python cache to avoid import issues
 find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
-
-# Clear stale bytecode
-find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 # Run training
 echo ""

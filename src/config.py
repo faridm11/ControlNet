@@ -3,9 +3,16 @@ Configuration for ControlNet + Stable Diffusion 1.5 training.
 All hyperparameters and paths defined here for easy HPC job setup.
 """
 
-import os
 from pathlib import Path
 from src.utils import setup_paths_from_env, create_directory_structure
+
+# ============================================================================
+# CLASS VERSION
+# ============================================================================
+# v1: 35 classes (20 ADE20K + 10 new-color + 5 void-white)
+# v2: 21 classes (20 ADE20K + 1 void-white) — new-color classes merged into nearest ADE20K neighbor
+# Switch via env var: CLASS_VERSION=v2 sbatch jobs/train_phase1.sh
+CLASS_VERSION = "v2"  # "v1" = 35 classes, "v2" = 21 ADE20K-only classes
 
 # ============================================================================
 # PROJECT PATHS (Auto-configured for HPC/Local)
@@ -19,7 +26,7 @@ DATA_DIR = _PATHS['data_root']
 # Training data
 TRAIN_IMAGES_DIR = DATA_DIR / "train" / "images"
 TRAIN_MASKS_DIR = DATA_DIR / "train" / "labels"
-TRAIN_PROMPTS_FILE = DATA_DIR / "train" / "prompts" / "prompts.csv"
+TRAIN_PROMPTS_FILE = DATA_DIR / "train" / "prompts" / "prompts.csv"  # same for v1/v2 — prompts are semantic
 
 # Test/Validation data
 VAL_IMAGES_DIR = DATA_DIR / "test" / "images"
@@ -48,12 +55,12 @@ USE_XFORMERS = True  # Memory efficient attention
 USE_LORA = True  # Enable LoRA for ControlNet
 
 # ControlNet LoRA (mandatory)
-CONTROLNET_LORA_RANK = 16
+CONTROLNET_LORA_RANK = 8
 CONTROLNET_LORA_ALPHA = 16
 CONTROLNET_LORA_DROPOUT = 0.1  # Higher dropout for small dataset (~1k images)
 CONTROLNET_LORA_TARGET_MODULES = [
     "to_q", "to_k", "to_v", "to_out.0",
-    "controlnet_cond_embedding.conv_in",  # Maps new RGB colors → features; 14/35 classes use new colors
+    "controlnet_cond_embedding.conv_in",  # Maps RGB colors → features (new colors in v1; all ADE20K in v2)
 ]
 
 # UNet LoRA — disabled: freeze UNet entirely, only ControlNet LoRA trains (matches HF reference)
@@ -120,11 +127,32 @@ NUM_IMAGES_PER_PROMPT = 4  # Variations per prompt
 NOISE_SCHEDULER = "ddpm"  # Options: "ddpm", "ddim", "pndm"
 
 # ============================================================================
+# EVALUATION METRICS (final eval after training — never affect the loss)
+# ============================================================================
+# FID is unreliable at n=50 (rank-deficient Inception covariance) — kept only
+# as a relative trend. KID is the unbiased small-sample alternative to trust.
+# LPIPS/CLIP are per-sample (gen vs paired GT / prompt) → reliable at n=50.
+EVAL_FID = True
+EVAL_KID = True
+EVAL_LPIPS = True
+EVAL_CLIP = True
+EVAL_KID_SUBSET = 50  # KID subset_size; must be <= number of eval samples (val set = 50)
+CLIP_MODEL_ID = "openai/clip-vit-base-patch16"  # cached in HF_HOME
+
+# Periodic generation-based eval DURING training (to get KID/LPIPS curves).
+# Every N epochs we build a throwaway pipeline from a deepcopy of the ControlNet
+# (LoRA merged into the copy only — the live trainable model is never mutated),
+# generate the val set, and log the metrics into the CSV so they can be plotted.
+# Set 0 to disable (then metrics are computed only once at the end of training).
+# Cost: ~1 full val-set generation per triggered epoch.
+EVAL_EVERY_N_EPOCHS = 5
+
+# ============================================================================
 # DATA CONFIGURATION
 # ============================================================================
 # Image/Mask settings
 RESOLUTION = 512  # SD 1.5 native resolution
-NUM_CLASSES = 35  # All 35 original classes (21 use ADE20K colors, 14 use new unique colors)
+NUM_CLASSES = 35 if CLASS_VERSION == "v1" else 21  # v1: 35 classes, v2: 21 merged ADE20K-only classes
 
 # Data loading
 NUM_WORKERS = 4
@@ -158,10 +186,7 @@ USE_SEGMENTOR_LOSS = False  # Semantic consistency loss
 SEGMENTOR_CHECKPOINT = None  # Path to frozen segmentor model
 SEGMENTOR_LOSS_WEIGHT = 0.1  # Lambda (λ) - ramp 0.1 → 0.5 as per doc
 
-# ============================================================================
-# ============================================================================
-# LOGGING & CHECKPOINTING
-# ============================================================================
+#===============================================
 # Logging
 LOG_DIR = _PATHS['log_dir']
 LOGGING_STEPS = 50
@@ -190,6 +215,7 @@ DEVICE = "cuda"  # Will be auto-detected
 
 # Reproducibility
 SEED = 42
+OVERFIT_FIXED_SEED = False  # Reset seed every epoch — only for overfit sanity checks
 
 # ============================================================================
 # HELPER FUNCTIONS

@@ -28,10 +28,17 @@ else:
     from .transforms import MaskAugmentation, NoAugmentation
     from .. import config
 
-from class_mapping import COLOR_PALETTE, NUM_CLASSES
+# Masks on disk are always V1 IDs (0–34). For v2 we remap at load time.
+_V1_NUM_CLASSES = 35
 
-# Build palette tensor from class_mapping.py — single source of truth for all colors.
-# Shape: (35, 3), values in [0, 1].
+if config.CLASS_VERSION == "v2":
+    from class_mapping_v2 import COLOR_PALETTE, NUM_CLASSES, REMAP_V1_TO_V2 as _REMAP_DICT
+    _REMAP = np.array([_REMAP_DICT[i] for i in range(_V1_NUM_CLASSES)], dtype=np.int64)
+else:
+    from class_mapping import COLOR_PALETTE, NUM_CLASSES
+    _REMAP = None
+
+# Build palette tensor — shape (NUM_CLASSES, 3), values in [0, 1].
 PALETTE = torch.tensor(
     [COLOR_PALETTE[i] for i in range(NUM_CLASSES)],
     dtype=torch.float32
@@ -180,7 +187,24 @@ class ControlNetDataset(Dataset):
             
             # Convert mask to numpy for augmentation at NATIVE resolution
             mask_np = np.array(mask)
-            
+
+            # Validate mask: must be 2D with IDs in V1 range (masks on disk are always V1)
+            if mask_np.ndim != 2:
+                raise ValueError(
+                    f"Expected 2D mask, got shape {mask_np.shape} for {item['mask_name']}. "
+                    f"Likely loaded as RGB — check export format."
+                )
+            invalid_ids = np.setdiff1d(np.unique(mask_np), np.arange(_V1_NUM_CLASSES))
+            if len(invalid_ids) > 0:
+                raise ValueError(
+                    f"Mask {item['mask_name']} contains invalid class IDs: {invalid_ids}. "
+                    f"Valid range is 0–{_V1_NUM_CLASSES - 1}."
+                )
+
+            # Remap V1 IDs → V2 IDs if running in v2 mode
+            if _REMAP is not None:
+                mask_np = _REMAP[mask_np]
+
             # Apply mask augmentation BEFORE resizing (cleaner, no interpolation artifacts)
             mask_np = self.mask_augmentation(mask_np)
             

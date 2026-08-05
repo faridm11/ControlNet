@@ -82,7 +82,7 @@ class Trainer:
         # CSV logging
         self.metrics_log_path = config.LOG_DIR / f"metrics_{self.run_id}.csv"
         with open(self.metrics_log_path, 'w') as f:
-            f.write("step,epoch,train_loss,val_loss,lr,grad_norm\n")
+            f.write("step,epoch,train_loss,val_loss,lr,grad_norm,fid,kid,lpips,clip_prompt,clip_img\n")
 
         # Evaluator
         self.evaluator = ControlNetEvaluator(device=self.device)
@@ -161,7 +161,13 @@ class Trainer:
 
     def _create_scheduler(self):
         """Create LR scheduler. Steps counted in optimizer steps (not micro-batches)."""
-        steps_per_epoch = len(self.train_loader) // config.GRADIENT_ACCUMULATION_STEPS
+        # The training loop does one step per accum window PLUS one leftover step
+        # when the loader isn't divisible by accum (see train()). Count that
+        # leftover so total_steps matches the real number of optimizer steps —
+        # otherwise the cosine schedule reaches lr=0 a fraction of an epoch early.
+        accum = config.GRADIENT_ACCUMULATION_STEPS
+        n_batches = len(self.train_loader)
+        steps_per_epoch = n_batches // accum + (1 if n_batches % accum else 0)
         total_steps = steps_per_epoch * self.num_epochs
 
         print(f"\nScheduler: {config.LR_SCHEDULER}")
@@ -190,6 +196,9 @@ class Trainer:
 
         for epoch in range(self.num_epochs):
             self.epoch = epoch
+            if config.OVERFIT_FIXED_SEED:
+                torch.manual_seed(config.SEED)
+                torch.cuda.manual_seed(config.SEED)
             print(f"\nEpoch {epoch + 1}/{self.num_epochs}")
             print("-" * 70)
 
@@ -290,19 +299,42 @@ class Trainer:
                 self.best_val_loss = val_loss
                 print("NEW BEST VAL LOSS!")
 
+            # Periodic generation-based eval (gives KID/LPIPS curves over training)
+            gen_metrics = None
+            if config.EVAL_EVERY_N_EPOCHS and (epoch + 1) % config.EVAL_EVERY_N_EPOCHS == 0:
+                print("Running periodic generation eval (FID/KID/LPIPS/CLIP)...")
+                gen_metrics = self._periodic_generation_eval()
+                if gen_metrics:
+                    def _g(v, p=4):
+                        return f"{v:.{p}f}" if isinstance(v, (int, float)) else "n/a"
+                    print(f"  FID={_g(gen_metrics['fid'],2)} | KID={_g(gen_metrics['kid_mean'],5)} "
+                          f"| LPIPS={_g(gen_metrics['lpips'])} | CLIP(prompt)={_g(gen_metrics['clip_prompt'])} "
+                          f"| CLIP(img)={_g(gen_metrics['clip_img'])}")
+
+            gm = gen_metrics or {}
+            def _csv(v, p=6):
+                return f"{v:.{p}f}" if isinstance(v, (int, float)) else ""
             with open(self.metrics_log_path, 'a') as f:
-                f.write(f"{self.global_step},{self.epoch},{epoch_avg_loss:.6f},{val_loss:.6f},{lr:.8f},{epoch_avg_gnorm:.6f}\n")
+                f.write(
+                    f"{self.global_step},{self.epoch},{epoch_avg_loss:.6f},{val_loss:.6f},"
+                    f"{lr:.8f},{epoch_avg_gnorm:.6f},{_csv(gm.get('fid'),4)},{_csv(gm.get('kid_mean'),8)},"
+                    f"{_csv(gm.get('lpips'))},{_csv(gm.get('clip_prompt'))},{_csv(gm.get('clip_img'))}\n"
+                )
 
             if config.USE_WANDB and WANDB_AVAILABLE:
-                wandb.log({
+                log_dict = {
                     "epoch/val_loss": val_loss,
                     "epoch/train_loss": epoch_avg_loss,
                     "epoch/grad_norm": epoch_avg_gnorm,
                     "epoch": epoch + 1,
-                }, step=self.global_step)
+                }
+                for k in ('fid', 'kid_mean', 'lpips', 'clip_prompt', 'clip_img'):
+                    if isinstance(gm.get(k), (int, float)):
+                        log_dict[f"epoch/{k}"] = gm[k]
+                wandb.log(log_dict, step=self.global_step)
 
             self.save_checkpoint(is_best_val=is_best_val)
-            plot_training_curves(self.metrics_log_path, self.output_dir)
+            plot_training_curves(self.metrics_log_path, self.output_dir, run_id=self.run_id)
             print(f"{'='*70}\n")
 
         # ---- Post-training: load best model, FID + samples ----
@@ -314,7 +346,7 @@ class Trainer:
         print(f"Run ID: {self.run_id}")
         print("=" * 70)
 
-        best_val_path = config.CHECKPOINT_DIR / "best_val_model.pt"
+        best_val_path = config.CHECKPOINT_DIR / f"{self.run_id}_LoRA.pt"
         if best_val_path.exists():
             print(f"\nLoading best val model from {best_val_path}")
             checkpoint = torch.load(best_val_path, map_location='cpu', weights_only=False)
@@ -330,24 +362,51 @@ class Trainer:
         self._build_pipeline()
         self.save_merged_controlnet()
         final_results = self.evaluate_full(control_strengths=[config.CONTROLNET_CONDITIONING_SCALE])
-        print(f"FID: {final_results['best_fid']:.2f}")
-        print(f"mIoU: {final_results['best_miou']:.4f} (placeholder)")
+        r = final_results['results'][0] if final_results['results'] else {}
+
+        def _f(v, p=4):
+            return f"{v:.{p}f}" if isinstance(v, (int, float)) else "n/a"
+
+        print("\nFinal metrics (control_strength="
+              f"{config.CONTROLNET_CONDITIONING_SCALE}):")
+        print(f"  FID         : {_f(r.get('fid'), 2)}   (unreliable at n=50 — trend only)")
+        print(f"  KID (mean)  : {_f(r.get('kid_mean'), 5)} ± {_f(r.get('kid_std'), 5)}   (trust this over FID)")
+        print(f"  LPIPS↓ vs GT: {_f(r.get('lpips'))}   (lower = closer to real image)")
+        print(f"  CLIP prompt↑: {_f(r.get('clip_prompt'))}   (image↔text alignment)")
+        print(f"  CLIP img↑   : {_f(r.get('clip_img'))}   (image↔ground-truth similarity)")
+        print(f"  mIoU        : {_f(r.get('miou'))}   (placeholder until Phase 2)")
 
         print("\nGenerating final samples...")
         self._run_generate_samples()
 
         if config.USE_WANDB and WANDB_AVAILABLE:
-            wandb.log({"final/fid": final_results['best_fid']}, step=self.global_step)
+            wandb.log({
+                f"final/{k}": v for k, v in r.items()
+                if isinstance(v, (int, float))
+            }, step=self.global_step)
             wandb.finish()
 
     @torch.inference_mode()
     def validate(self):
-        """Validation loss — random noise/timesteps each epoch (no fixed seed)."""
+        """Validation loss — FIXED noise/timesteps every epoch.
+
+        The DDPM epsilon-loss is strongly timestep-dependent, so drawing fresh
+        random noise/timesteps each epoch made val_loss fluctuate on which
+        timesteps were sampled, not on model quality (and made best-checkpoint
+        selection essentially random). We save the global RNG, reseed to a fixed
+        value so every epoch evaluates on the *same* per-image noise+timesteps,
+        then restore the RNG so training's stochastic stream is untouched.
+        """
         self.model.eval()
         val_losses = []
 
         rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state(self.device) if self.device.type == 'cuda' else None
+
+        # Fixed validation noise/timesteps → val_loss tracks the model, not luck.
+        torch.manual_seed(config.SEED)
+        if self.device.type == 'cuda':
+            torch.cuda.manual_seed(config.SEED)
 
         for batch in self.val_loader:
             images = batch['image'].to(self.device)
@@ -367,44 +426,132 @@ class Trainer:
 
     @torch.inference_mode()
     def evaluate_full(self, control_strengths=[1.0]):
-        """Full evaluation: FID + mIoU (mIoU placeholder until Phase 2)."""
+        """Full evaluation: FID + KID + LPIPS + CLIP + mIoU (mIoU placeholder until Phase 2).
+
+        All generation-based metrics are computed in a single pass per control
+        strength. Results are also written to a per-run JSON in LOG_DIR so runs
+        can be compared cleanly afterwards.
+        """
         self.model.eval()
         print("Running full evaluation...")
+
+        def fmt(v, p=4):
+            return f"{v:.{p}f}" if v is not None else "n/a"
 
         results = []
         for strength in control_strengths:
             print(f"  Control strength: {strength}")
 
+            metrics = self.evaluator.evaluate(
+                self.model, self.val_loader, self.pipeline,
+                control_strength=strength, num_inference_steps=config.NUM_INFERENCE_STEPS,
+            )
             miou_metrics = self.evaluator.evaluate_miou(
                 self.model, self.val_loader, self.pipeline,
                 control_strength=strength, num_inference_steps=config.NUM_INFERENCE_STEPS,
             )
-            fid = self.evaluator.evaluate_fid(
-                self.model, self.val_loader, self.pipeline,
-                control_strength=strength, num_inference_steps=config.NUM_INFERENCE_STEPS,
-            )
 
-            results.append({
+            row = {
                 'control_strength': strength,
                 'miou': miou_metrics.get('miou', 0.0),
-                'fid': fid,
-            })
-            print(f"    FID: {fid:.2f} | mIoU: {miou_metrics.get('miou', 0.0):.4f}")
+                'fid': metrics['fid'],
+                'kid_mean': metrics['kid_mean'],
+                'kid_std': metrics['kid_std'],
+                'lpips': metrics['lpips'],
+                'clip_prompt': metrics['clip_prompt'],
+                'clip_img': metrics['clip_img'],
+            }
+            results.append(row)
+            print(f"    FID: {fmt(row['fid'], 2)} | KID: {fmt(row['kid_mean'], 5)} "
+                  f"| LPIPS: {fmt(row['lpips'])} | CLIP(prompt): {fmt(row['clip_prompt'])} "
+                  f"| CLIP(img): {fmt(row['clip_img'])} | mIoU: {fmt(row['miou'])}")
 
-            if self.evaluator.fid_metric is not None:
-                self.evaluator.fid_metric.reset()
             gc.collect()
             torch.cuda.empty_cache()
 
-        best_fid_result = min(results, key=lambda x: x['fid'])
-        best_miou_result = max(results, key=lambda x: x['miou'])
-        self.model.train()
+        # Best by each metric (guard against None when a metric is disabled)
+        def best(key, mode):
+            vals = [r for r in results if r[key] is not None]
+            if not vals:
+                return None
+            return (min if mode == 'min' else max)(vals, key=lambda x: x[key])[key]
 
+        best_fid = best('fid', 'min')
+        best_miou = best('miou', 'max')
+
+        # Persist per-run metrics for cross-run comparison
+        eval_path = config.LOG_DIR / f"{self.run_id}_final_eval.json"
+        try:
+            import json
+            with open(eval_path, 'w') as f:
+                json.dump({'run_id': str(self.run_id), 'results': results}, f, indent=2)
+            print(f"Final metrics written to {eval_path}")
+        except Exception as e:
+            print(f"[WARN] could not write eval JSON: {e}")
+
+        self.model.train()
         return {
             'results': results,
-            'best_miou': best_miou_result['miou'],
-            'best_fid': best_fid_result['fid'],
+            'best_miou': best_miou if best_miou is not None else 0.0,
+            'best_fid': best_fid if best_fid is not None else float('inf'),
         }
+
+    @torch.inference_mode()
+    def _periodic_generation_eval(self):
+        """Generation metrics (FID/KID/LPIPS/CLIP) DURING training — non-destructive.
+
+        Builds a throwaway pipeline from a DEEPCOPY of the ControlNet, with LoRA
+        merged into that copy only. The live trainable model is never mutated, so
+        the optimizer's parameters and LoRA adapters stay intact. Any failure is
+        caught and returns None so training is never jeopardised by this feature.
+        """
+        import copy
+        from diffusers import StableDiffusionControlNetPipeline, DDIMScheduler
+
+        cn_copy = None
+        unet_copy = None
+        try:
+            cn_copy = copy.deepcopy(self.model.controlnet)
+            merged_cn = cn_copy.merge_and_unload()  # destructive on the COPY only
+            merged_cn.eval()
+
+            # UNet: with USE_UNET_LORA=False (default) it's the frozen base UNet, which
+            # has no merge_and_unload — we pass it through unchanged (shared read-only).
+            # If UNet LoRA is ever enabled it's a PEFT model, so we merge a DEEPCOPY
+            # (non-destructive on the live model), mirroring the ControlNet handling above.
+            if hasattr(self.model.unet, "merge_and_unload"):
+                unet_copy = copy.deepcopy(self.model.unet)
+                eval_unet = unet_copy.merge_and_unload()
+                eval_unet.eval()
+            else:
+                eval_unet = self.model.unet
+
+            pipeline = StableDiffusionControlNetPipeline(
+                vae=self.model.vae,
+                text_encoder=self.model.text_encoder,
+                tokenizer=self.model.tokenizer,
+                unet=eval_unet,                  # frozen base (USE_UNET_LORA=False) — shared read-only
+                controlnet=merged_cn,
+                scheduler=DDIMScheduler.from_pretrained(config.SD_MODEL_ID, subfolder="scheduler"),
+                safety_checker=None,
+                feature_extractor=None,
+            )
+            pipeline.to(self.device)
+            pipeline.set_progress_bar_config(disable=True)
+
+            return self.evaluator.evaluate(
+                self.model, self.val_loader, pipeline,
+                control_strength=config.CONTROLNET_CONDITIONING_SCALE,
+                num_inference_steps=config.NUM_INFERENCE_STEPS,
+            )
+        except Exception as e:
+            print(f"[WARN] periodic generation eval failed (training continues): {e}")
+            return None
+        finally:
+            del cn_copy
+            del unet_copy
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def _build_pipeline(self):
         """Merge LoRA and build inference pipeline. Called once after training."""
