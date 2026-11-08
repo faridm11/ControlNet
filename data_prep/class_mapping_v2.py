@@ -11,7 +11,8 @@ in dataset.py when CLASS_VERSION=v2.
 
 V1 → V2 merges:
   crosswalk(3), cycling_lane(4), parking_driveway(5),
-  railtrack(6), curb(7)                                → road(1)
+  railtrack(6)                                         → road(1)
+  curb(7)                                              → sidewalk(2)
   rider(9)                                             → person(3)
   tramtrain(13)                                        → bus(6)
   caravan(16), trailer(17)                             → truck(5)

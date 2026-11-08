@@ -18,7 +18,8 @@ from typing import Optional
 import os
 
 from .. import config
-from ..losses import diffusion_loss
+from ..losses import diffusion_loss, seg_consistency_loss
+from ..segmentor import load_segmentor, segmentor_logits, SEG_IGNORE
 
 # Try to import PEFT for LoRA
 try:
@@ -159,6 +160,16 @@ class DiffusionControlNet(nn.Module):
         )
         print("✓ DDPM scheduler loaded")
         
+        # 7. Frozen segmentor for the Phase-2 loss. Kept OUT of the module tree (plain list)
+        # so model.train() never switches its BatchNorm layers to training mode and it is
+        # not counted or saved with the diffusion model.
+        self._segmentor = []
+        if config.USE_SEGMENTOR_LOSS:
+            print("\nLoading frozen segmentor for the segmentation-consistency loss...")
+            self._segmentor.append(load_segmentor(device))
+            print(f"✓ Segmentor loaded (λ={config.SEGMENTOR_LOSS_WEIGHT}, t<{config.SEGMENTOR_LOSS_MAX_TIMESTEP}, "
+                  f"max {config.SEGMENTOR_LOSS_MAX_SAMPLES} samples/batch)")
+
         print("\n" + "=" * 60)
         print("MODEL INITIALIZATION COMPLETE")
         print("=" * 60)
@@ -268,9 +279,14 @@ class DiffusionControlNet(nn.Module):
         mask_rgb: torch.Tensor,
         prompts: list,
         timesteps: Optional[torch.Tensor] = None,
+        mask_seg: Optional[torch.Tensor] = None,
+        seg_weight: float = 0.0,
     ):
         """
         Forward pass for training.
+
+        Phase 2: when mask_seg is given and seg_weight > 0 (training only), the
+        segmentation-consistency loss is added: loss = diffusion + seg_weight * seg.
         
         Args:
             images: Ground truth images (B, 3, H, W), range [-1, 1]
@@ -321,7 +337,7 @@ class DiffusionControlNet(nn.Module):
 
         text_embeddings = self.encode_text(prompts)
         
-        # 6. Prepare mask conditioning (normalize RGB to [-1, 1])
+        # 6. Prepare mask conditioning (stays in [0, 1] — same range the diffusers pipeline feeds)
         mask_conditioning = self.prepare_mask_conditioning(mask_rgb)
         
         # 7. ControlNet forward pass — no conditioning_scale here.
@@ -346,13 +362,46 @@ class DiffusionControlNet(nn.Module):
         ).sample
         
         # 9. Compute loss
-        loss = diffusion_loss(noise_pred, noise)
-        
+        diff_loss = diffusion_loss(noise_pred, noise)
+        loss = diff_loss
+
+        # 10. Phase 2: segmentation-consistency loss on the decoded denoised estimate
+        seg_loss = None
+        if self.training and self._segmentor and mask_seg is not None and seg_weight > 0:
+            seg_loss = self._segmentation_loss(noisy_latents, noise_pred, timesteps, mask_seg)
+            if seg_loss is not None:
+                loss = diff_loss + seg_weight * seg_loss
+
         return {
             "loss": loss,
+            "diffusion_loss": diff_loss,
+            "seg_loss": seg_loss,
             "noise_pred": noise_pred,
             "noise": noise,
         }
+
+    def _segmentation_loss(self, noisy_latents, noise_pred, timesteps, mask_seg):
+        """
+        Segmentor loss on x0_hat = (x_t - sqrt(1-ᾱ_t)·ε_pred) / sqrt(ᾱ_t), decoded by the frozen VAE.
+
+        Only low-noise samples (t < SEGMENTOR_LOSS_MAX_TIMESTEP) are used: at high noise the
+        one-step estimate is a blur and the segmentor's output on it is meaningless.
+        Returns None when no sample in the batch qualifies.
+        """
+        keep = (timesteps < config.SEGMENTOR_LOSS_MAX_TIMESTEP).nonzero(as_tuple=True)[0]
+        keep = keep[:config.SEGMENTOR_LOSS_MAX_SAMPLES]
+        if keep.numel() == 0:
+            return None
+
+        # fp32 from here on: VAE and segmentor are frozen fp32 models, gradients flow through them
+        with torch.amp.autocast("cuda", enabled=False):
+            alpha_bar = self.noise_scheduler.alphas_cumprod.to(noisy_latents.device)[timesteps[keep]]
+            alpha_bar = alpha_bar.view(-1, 1, 1, 1).float()
+            x0_hat = (noisy_latents[keep].float() - (1 - alpha_bar).sqrt() * noise_pred[keep].float()) / alpha_bar.sqrt()
+            decoded = self.vae.decode(x0_hat / self.vae.config.scaling_factor).sample
+            images_01 = (decoded * 0.5 + 0.5).clamp(0, 1)
+            logits = segmentor_logits(self._segmentor[0], images_01)
+            return seg_consistency_loss(logits, mask_seg[keep], ignore_index=SEG_IGNORE)
     
     def get_trainable_parameters(self):
         """Get all trainable parameters (ControlNet LoRA + UNet LoRA adapters)."""
@@ -371,7 +420,8 @@ class DiffusionControlNet(nn.Module):
 
     def load_checkpoint(self, checkpoint_path: str):
         """Load LoRA-only checkpoint back into the already-initialized model."""
-        lora_state = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        # weights_only=False: our own checkpoints also carry optimizer/scheduler state and plain metadata
+        lora_state = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         # Merge LoRA keys into current state dict (base weights stay unchanged)
         cn_state = self.controlnet.state_dict()
         cn_state.update(lora_state["controlnet_lora"])

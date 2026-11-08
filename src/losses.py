@@ -125,6 +125,37 @@ def segmentation_loss(
     return ce + dice + boundary_weight * boundary
 
 
+def seg_consistency_loss(logits: torch.Tensor, target: torch.Tensor, ignore_index: int = 255) -> torch.Tensor:
+    """
+    Phase 2 loss actually used in training: cross-entropy + soft Dice between the
+    segmentor's logits on the decoded image and the ground-truth mask, skipping
+    pixels marked ignore_index.
+
+    Args:
+        logits: Segmentor output, shape (B, C, H, W)
+        target: Class IDs, shape (B, H, W), values in [0, C) or ignore_index
+
+    Returns:
+        Scalar loss (0 if no pixel is valid)
+    """
+    valid = target != ignore_index
+    if not valid.any():
+        return logits.sum() * 0.0
+
+    ce = F.cross_entropy(logits, target, ignore_index=ignore_index)
+
+    num_classes = logits.shape[1]
+    probs = F.softmax(logits, dim=1)
+    onehot = F.one_hot(target.masked_fill(~valid, 0), num_classes).permute(0, 3, 1, 2).float()
+    m = valid.unsqueeze(1).float()
+    intersection = (probs * onehot * m).sum(dim=(0, 2, 3))
+    denom = ((probs + onehot) * m).sum(dim=(0, 2, 3))
+    present = (onehot * m).sum(dim=(0, 2, 3)) > 0
+    dice = 1.0 - ((2.0 * intersection + 1.0) / (denom + 1.0))[present].mean()
+
+    return ce + dice
+
+
 # ============================================================================
 # Combined Loss (Phase 1 + Phase 2)
 # ============================================================================

@@ -34,7 +34,7 @@ def mask_rgb_to_pil(mask_rgb: torch.Tensor, resolution: int) -> Image.Image:
     """
     assert mask_rgb.ndim == 3 and mask_rgb.shape[0] == 3, \
         f"Expected (3, H, W), got {mask_rgb.shape}"
-    mask_np = (mask_rgb.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+    mask_np = np.round(mask_rgb.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
     pil_img = Image.fromarray(mask_np).convert("RGB")
     if pil_img.size != (resolution, resolution):
         pil_img = pil_img.resize((resolution, resolution), Image.NEAREST)
@@ -153,13 +153,19 @@ def generate_samples(
             generator=generator,
             num_inference_steps=config.NUM_INFERENCE_STEPS,
             guidance_scale=config.GUIDANCE_SCALE,
+            negative_prompt=config.NEGATIVE_PROMPT or None,
             controlnet_conditioning_scale=config.CONTROLNET_CONDITIONING_SCALE,
         ).images
         all_generated.append(generated)
 
     # Save grids
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tag = f"job{run_id}_epoch{epoch}_step{step:06d}_{timestamp}" if run_id else f"epoch{epoch}_step{step:06d}_{timestamp}"
+    if not run_id:
+        tag = f"epoch{epoch}_step{step:06d}_{timestamp}"
+    elif str(run_id).isdigit():  # dataset 1: plain SLURM job id
+        tag = f"job{run_id}_epoch{epoch}_step{step:06d}_{timestamp}"
+    else:                        # dataset-prefixed run id, e.g. sanpo_1838500
+        tag = f"{run_id}_epoch{epoch}_step{step:06d}_{timestamp}"
     sample_dir = Path(output_dir) / "samples" / tag
     sample_dir.mkdir(parents=True, exist_ok=True)
 

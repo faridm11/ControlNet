@@ -52,6 +52,9 @@ export HF_HOME=$WORK/huggingface_cache
 # Set Hugging Face cache
 export HF_DATASETS_CACHE=$HF_HOME
 
+# All models are already in the cache — never depend on the Hub being reachable
+export HF_HUB_OFFLINE=1
+
 # Disable progress bars in logs
 export TRANSFORMERS_VERBOSITY=error
 export HF_HUB_DISABLE_PROGRESS_BARS=1

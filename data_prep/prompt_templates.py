@@ -182,7 +182,7 @@ def format_object_list(class_names, use_and=True):
     return ", ".join(class_names)
 
 
-def get_present_objects(mask_array, max_objects=6):
+def get_present_objects(mask_array, max_objects=6, min_area_frac=0.0):
     """
     Return prompt-friendly names for salient classes present in mask_array.
 
@@ -199,11 +199,14 @@ def get_present_objects(mask_array, max_objects=6):
     Args:
         mask_array: numpy array with class IDs 0-34
         max_objects: hard cap on the number of objects returned (default 6)
+        min_area_frac: a class counts as present only if it covers at least this
+            fraction of the mask (0.0 = any single pixel counts)
 
     Returns:
         list[str]: e.g. ["pedestrian", "tram", "traffic light"]
     """
-    present_ids = set(np.unique(mask_array).tolist())
+    ids, counts = np.unique(mask_array, return_counts=True)
+    present_ids = {int(i) for i, c in zip(ids, counts) if c >= min_area_frac * mask_array.size}
 
     priority_groups = [
         [8, 9],                             # people
@@ -359,7 +362,7 @@ def get_semantic_context(mask_array):
     return ""
 
 
-def generate_prompt_from_mask(mask_array, seed=None):
+def generate_prompt_from_mask(mask_array, seed=None, min_area_frac=0.0):
     """
     Generate a complete text prompt from a segmentation mask.
 
@@ -377,6 +380,7 @@ def generate_prompt_from_mask(mask_array, seed=None):
     Args:
         mask_array: numpy array with class IDs 0-34
         seed: optional random seed for reproducibility
+        min_area_frac: minimum mask fraction for a class to be named (see get_present_objects)
 
     Returns:
         str: complete prompt, e.g.
@@ -412,7 +416,7 @@ def generate_prompt_from_mask(mask_array, seed=None):
         sensor = random.choice(SENSOR_REALISM)
 
     # 4. Salient objects from mask
-    objects = get_present_objects(mask_array)
+    objects = get_present_objects(mask_array, min_area_frac=min_area_frac)
     object_phrase = format_object_list(objects) + " visible" if objects else ""
 
     # 5. Semantic anchor (scene-filtered)

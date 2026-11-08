@@ -57,3 +57,55 @@ ENVIRONMENT_SETUP.md
 QUICK_START.md
 SETUP_COMPLETE.md
 conda_packages_list.txt
+
+# ── Added 2026-11-08: only code, job scripts and documentation go to GitLab ───
+# Data, checkpoints, generated images, logs and the results document go to the shared Drive.
+
+# Datasets: images and labels stay out; small prompt/metadata files that are needed to reproduce stay in
+data_sanpo/train/images/
+data_sanpo/train/labels/
+data_sanpo/test/images/
+data_sanpo/test/labels/
+data_sanpo_200/
+data_sanpo/check_overlays/
+data_prep/sanpo/logs/
+data_prep/sanpo/void_per_frame.csv
+
+# Superseded runs, old notes and personal files
+_archive_not_in_report/
+claude-tests/
+*.docx
+report_project.md
+EVALUATION.md
+IMPLEMENTATION_SUMMARY.md
+test_*.py
+setup_environment.sh
+setup_local.sh
+jobs/test_rtx3080.sh
+jobs/test_sampling.sh
+*.pt
+
+# controlnet_testing/: keep scripts and the three documents, nothing produced by runs
+controlnet_testing/**
+!controlnet_testing/**/
+!controlnet_testing/**/*.py
+!controlnet_testing/**/*.sh
+!controlnet_testing/README.md
+!controlnet_testing/EXPERIMENT_LOG.md
+!controlnet_testing/RUN_INDEX.md
+!controlnet_testing/step20_downstream_sanpo/splits.json
+controlnet_testing/_code_backups/
+controlnet_testing/scratch_outputs/
+controlnet_testing/**/run/
+controlnet_testing/**/logs/
+controlnet_testing/**/eval/
+controlnet_testing/**/eval_mapillary/
+controlnet_testing/**/comparison/
+controlnet_testing/**/images/
+controlnet_testing/**/images_by_white/
+controlnet_testing/**/results/
+controlnet_testing/**/synthetic/
+controlnet_testing/**/generator_200/
+controlnet_testing/reporting/figures/
+controlnet_testing/jobs/downstream.sh
+controlnet_testing/step20_downstream_sanpo/submit_downstream_100.sh

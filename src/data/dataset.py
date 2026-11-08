@@ -24,25 +24,86 @@ if __name__ == "__main__":
         sys.path.insert(0, str(sensation_root))
     from DDPM.src.data.transforms import MaskAugmentation, NoAugmentation
     from DDPM.src import config
+    from DDPM.src.segmentor import V1_TO_SEG, SEG_JUDGE, V1_TO_MAPILLARY_JUDGE, SANPO_TO_MAPILLARY_JUDGE
 else:
     from .transforms import MaskAugmentation, NoAugmentation
     from .. import config
+    from ..segmentor import V1_TO_SEG, SEG_JUDGE, V1_TO_MAPILLARY_JUDGE, SANPO_TO_MAPILLARY_JUDGE
 
-# Masks on disk are always V1 IDs (0–34). For v2 we remap at load time.
+# Label ids on disk ("raw"):
+#   dataset 1 (data/)        — the 35 V1 ids (0–34); v2 remaps them to 21 classes at load time
+#   dataset 2 (data_sanpo/)  — SANPO's own 31 ids (0–30), conditioned with ADE20K colours
 _V1_NUM_CLASSES = 35
 
-if config.CLASS_VERSION == "v2":
-    from class_mapping_v2 import COLOR_PALETTE, NUM_CLASSES, REMAP_V1_TO_V2 as _REMAP_DICT
-    _REMAP = np.array([_REMAP_DICT[i] for i in range(_V1_NUM_CLASSES)], dtype=np.int64)
-else:
-    from class_mapping import COLOR_PALETTE, NUM_CLASSES
+if config.CLASS_VERSION == "sanpo":
+    sys.path.insert(0, str(_data_prep_dir / "sanpo"))
+    from class_mapping_sanpo import COLOR_PALETTE, NUM_CLASSES, CLASS_NAMES, SANPO_TO_V1
+    _RAW_NUM_CLASSES = NUM_CLASSES
     _REMAP = None
+    _RAW_TO_SEG = (SANPO_TO_MAPILLARY_JUDGE if SEG_JUDGE in ("mapillary", "cityscapes", "ade20k")
+                   else V1_TO_SEG[np.array([SANPO_TO_V1[i] for i in range(NUM_CLASSES)])])
+elif config.CLASS_VERSION == "v2":
+    from class_mapping_v2 import COLOR_PALETTE, NUM_CLASSES, CLASS_NAMES, REMAP_V1_TO_V2 as _REMAP_DICT
+    _RAW_NUM_CLASSES = _V1_NUM_CLASSES
+    _REMAP = np.array([_REMAP_DICT[i] for i in range(_V1_NUM_CLASSES)], dtype=np.int64)
+    _RAW_TO_SEG = V1_TO_MAPILLARY_JUDGE if SEG_JUDGE in ("mapillary", "cityscapes", "ade20k") else V1_TO_SEG
+else:
+    from class_mapping import COLOR_PALETTE, NUM_CLASSES, CLASS_NAMES
+    _RAW_NUM_CLASSES = _V1_NUM_CLASSES
+    _REMAP = None
+    _RAW_TO_SEG = V1_TO_MAPILLARY_JUDGE if SEG_JUDGE in ("mapillary", "cityscapes", "ade20k") else V1_TO_SEG
 
 # Build palette tensor — shape (NUM_CLASSES, 3), values in [0, 1].
 PALETTE = torch.tensor(
     [COLOR_PALETTE[i] for i in range(NUM_CLASSES)],
     dtype=torch.float32
 ) / 255.0
+
+
+# ---------------------------------------------------------------------------
+# Training-time prompt augmentation: vary the WORDING, never the content.
+# Prompts are "<base>, <conditions...>, <objects> visible". Each condition and each object is kept
+# with probability TRAIN_PROMPT_KEEP_PROB and the order is shuffled, so the model sees many true
+# phrasings of the same image and does not depend on one exact prompt. Nothing false is added.
+# ---------------------------------------------------------------------------
+import random as _random
+from generate_prompts import WEATHER_WORDS as _WEATHER, ENV_WORDS as _ENV
+from prompt_templates import format_object_list as _format_objects
+
+_CONDITION_WORDS = set(_WEATHER.values()) | set(_ENV.values())
+
+
+def split_prompt(prompt: str):
+    """-> (base, conditions, objects) for prompts made by data_prep/generate_prompts.py."""
+    parts = [x.strip() for x in prompt.split(", ")]
+    base, rest = parts[0], parts[1:]
+    conditions = [x for x in rest if x in _CONDITION_WORDS]
+    tail = [x for x in rest if x not in _CONDITION_WORDS]
+    objects = []
+    if tail and tail[-1].endswith(" visible"):
+        tail[-1] = tail[-1][: -len(" visible")]
+        for x in tail:
+            for y in x.split(" and "):
+                y = y.strip()
+                if y.startswith("and "):
+                    y = y[4:]
+                if y:
+                    objects.append(y)
+    else:
+        conditions += tail  # unknown words are kept as conditions (never dropped silently)
+    return base, conditions, objects
+
+
+def augment_prompt(prompt: str, keep_prob: float, rng=_random) -> str:
+    base, conditions, objects = split_prompt(prompt)
+    conditions = [c for c in conditions if rng.random() < keep_prob]
+    objects = [o for o in objects if rng.random() < keep_prob]
+    rng.shuffle(conditions)
+    rng.shuffle(objects)
+    parts = [base] + conditions
+    if objects:
+        parts.append(_format_objects(objects) + " visible")
+    return ", ".join(parts)
 
 
 class ControlNetDataset(Dataset):
@@ -68,6 +129,8 @@ class ControlNetDataset(Dataset):
         resolution: int = 512,
         augment_masks: bool = True,
         mask_aug_params: Optional[Dict] = None,
+        hflip: bool = False,
+        prompt_keep_prob: float = 1.0,
     ):
         """
         Args:
@@ -93,7 +156,9 @@ class ControlNetDataset(Dataset):
         self.masks_dir = Path(masks_dir)
         self.prompts_file = Path(prompts_file)
         self.resolution = resolution
-        
+        self.hflip = hflip
+        self.prompt_keep_prob = prompt_keep_prob  # < 1.0 = training-time prompt augmentation
+
         # Validate paths
         if not self.images_dir.exists():
             raise FileNotFoundError(f"Images directory not found: {self.images_dir}")
@@ -194,19 +259,27 @@ class ControlNetDataset(Dataset):
                     f"Expected 2D mask, got shape {mask_np.shape} for {item['mask_name']}. "
                     f"Likely loaded as RGB — check export format."
                 )
-            invalid_ids = np.setdiff1d(np.unique(mask_np), np.arange(_V1_NUM_CLASSES))
+            invalid_ids = np.setdiff1d(np.unique(mask_np), np.arange(_RAW_NUM_CLASSES))
             if len(invalid_ids) > 0:
                 raise ValueError(
                     f"Mask {item['mask_name']} contains invalid class IDs: {invalid_ids}. "
-                    f"Valid range is 0–{_V1_NUM_CLASSES - 1}."
+                    f"Valid range is 0–{_RAW_NUM_CLASSES - 1}."
                 )
+
+            # Mask augmentation on the raw ids, BEFORE resizing (no interpolation artifacts) and
+            # before anything is derived from the mask, so the conditioning colours and the
+            # segmentor target describe the same (augmented) layout. Id 0 is unlabeled/void in
+            # every label space, so occlusions and erosions map to void everywhere.
+            mask_np = self.mask_augmentation(mask_np)
+
+            # Segmentor target (10 classes + ignore) comes from the raw ids, not the remapped
+            # ones: V2 merges classes the segmentor distinguishes (e.g. cycling lane into road).
+            mask_seg = self.mask_transform(Image.fromarray(_RAW_TO_SEG[mask_np].astype(np.uint8)))
+            mask_seg = torch.from_numpy(np.array(mask_seg)).long()
 
             # Remap V1 IDs → V2 IDs if running in v2 mode
             if _REMAP is not None:
                 mask_np = _REMAP[mask_np]
-
-            # Apply mask augmentation BEFORE resizing (cleaner, no interpolation artifacts)
-            mask_np = self.mask_augmentation(mask_np)
             
             # Convert back to PIL
             mask = Image.fromarray(mask_np.astype(np.uint8))
@@ -218,6 +291,12 @@ class ControlNetDataset(Dataset):
             
             # Convert mask to numpy
             mask = np.array(mask)
+
+            # Joint horizontal flip (training only) — image, class mask and segmentor target together
+            if self.hflip and torch.rand(1).item() < 0.5:
+                image = image.flip(-1)
+                mask = np.ascontiguousarray(mask[:, ::-1])
+                mask_seg = mask_seg.flip(-1)
 
             # Convert to tensor
             mask = torch.from_numpy(mask).long()
@@ -231,7 +310,9 @@ class ControlNetDataset(Dataset):
             return {
                 'image': image,
                 'mask': mask,
-                'prompt': item['prompt'],
+                'mask_seg': mask_seg,
+                'prompt': (augment_prompt(item['prompt'], self.prompt_keep_prob)
+                           if self.prompt_keep_prob < 1.0 else item['prompt']),
                 'mask_rgb': mask_rgb,
                 'image_name': item['image_name'],
             }
@@ -266,6 +347,7 @@ def create_dataloader(
         return {
             'image':      torch.stack([item['image']    for item in batch]),
             'mask':       torch.stack([item['mask']     for item in batch]),
+            'mask_seg':   torch.stack([item['mask_seg'] for item in batch]),
             'mask_rgb':   torch.stack([item['mask_rgb'] for item in batch]),
             'prompt':     [item['prompt']     for item in batch],
             'image_name': [item['image_name'] for item in batch],
@@ -316,11 +398,13 @@ def create_train_dataset(resolution: int = 512, **kwargs) -> ControlNetDataset:
         resolution=resolution,
         augment_masks=config.USE_MASK_AUGMENTATION,
         mask_aug_params=mask_aug_params,
+        hflip=config.TRAIN_HFLIP,
+        prompt_keep_prob=config.TRAIN_PROMPT_KEEP_PROB,
         **kwargs
     )
 
 
-def create_val_dataset(resolution: int = 512, **kwargs) -> ControlNetDataset:
+def create_val_dataset(resolution: int = 512, full: bool = False, **kwargs):
     """
     Create dataset for validation without augmentation.
     Uses data/test/images, data/test/labels, and data/test/prompts/prompts.csv.
@@ -332,7 +416,7 @@ def create_val_dataset(resolution: int = 512, **kwargs) -> ControlNetDataset:
     Returns:
         ControlNetDataset without augmentation (test data)
     """
-    return ControlNetDataset(
+    ds = ControlNetDataset(
         images_dir=config.VAL_IMAGES_DIR,
         masks_dir=config.VAL_MASKS_DIR,
         prompts_file=config.VAL_PROMPTS_FILE,
@@ -340,6 +424,13 @@ def create_val_dataset(resolution: int = 512, **kwargs) -> ControlNetDataset:
         augment_masks=False,
         **kwargs
     )
+    n = config.VAL_SUBSET_SIZE
+    if full or not n or n >= len(ds):
+        return ds
+    # fixed, evenly spaced subset; the list is sorted by name = by recording session
+    idx = np.linspace(0, len(ds) - 1, n).round().astype(int).tolist()
+    print(f"  Using evaluation subset: {n} of {len(ds)} test samples (VAL_SUBSET_SIZE)")
+    return torch.utils.data.Subset(ds, idx)
 
 
 if __name__ == "__main__":

@@ -18,12 +18,16 @@ Generation uses deterministic per-batch seeds so the numbers are reproducible
 and comparable across runs.
 """
 
+from pathlib import Path
+
 import torch
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
 from . import config
+from .segmentor import (load_segmentor, segmentor_available, segmentor_logits,
+                        confusion_matrix, miou_from_confusion, SEG_NUM_CLASSES)
 
 try:
     from torchmetrics.image.fid import FrechetInceptionDistance
@@ -80,28 +84,22 @@ class ControlNetEvaluator:
     """
     Evaluator for ControlNet models.
 
-    FID/KID/LPIPS/CLIP are all available now. mIoU returns 0.0 until Phase 2.
-    The CLIP model is loaded lazily and cached; FID/KID/LPIPS are constructed
-    fresh per evaluate() call (cheap, and avoids stale feature buffers).
+    Computes FID/KID/LPIPS/CLIP and segmentor mIoU in one generation pass.
+    The CLIP model and the segmentor are loaded lazily and cached (the trainer hands
+    over the model's own frozen segmentor when the Phase-2 loss already loaded it).
+    FID/KID/LPIPS are constructed fresh per evaluate() call (cheap, no stale buffers).
+    The segmentor's result on the REAL images (miou_real) is computed once per val set
+    and cached: images, masks and segmentor never change.
     """
 
     def __init__(self, device: str = "cuda"):
         self.device = device
         self.segmentor = None
+        self._real_conf_cache = {}  # id(val dataset) -> confusion matrix of the segmentor on the real photos
         self._clip_model = None
         self._clip_processor = None
         # kept for backward-compat with code that calls .fid_metric.reset()
         self.fid_metric = None
-
-    def load_segmentor(self):
-        """Segmentor not yet implemented — mIoU will remain 0.0 until Phase 2."""
-        print("Segmentor not implemented yet — mIoU will be 0.0")
-
-    @torch.inference_mode()
-    def evaluate_miou(self, model, dataloader, pipeline, control_strength: float = 1.0,
-                      num_inference_steps: int = 35):
-        """Returns zeros until segmentor is implemented in Phase 2."""
-        return {'miou': 0.0, 'pixel_acc': 0.0}
 
     # -----------------------------------------------------------------------
     # CLIP helpers
@@ -148,7 +146,8 @@ class ControlNetEvaluator:
         """
         Run the pipeline once over the whole val set and compute every metric.
 
-        Returns a dict: {fid, kid_mean, kid_std, lpips, clip_prompt, clip_img}.
+        Returns a dict: {fid, kid_mean, kid_std, lpips, clip_prompt, clip_img, miou, pixel_acc,
+        miou_real, pixel_acc_real, iou_per_class}.
         Metrics that are unavailable or not requested are returned as None.
         """
         model.eval()
@@ -163,6 +162,16 @@ class ControlNetEvaluator:
         if LPIPS_AVAILABLE and config.EVAL_LPIPS:
             lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).to(self.device)
 
+        # Segmentor mIoU: generated images vs the mask, and real images vs the mask (the ceiling)
+        use_miou = config.EVAL_MIOU and segmentor_available()
+        if use_miou and self.segmentor is None:
+            shared = getattr(model, "_segmentor", None)
+            self.segmentor = shared[0] if shared else load_segmentor(self.device)
+        conf_gen = torch.zeros(SEG_NUM_CLASSES, SEG_NUM_CLASSES, dtype=torch.long)
+        real_key = id(dataloader.dataset)
+        need_real = use_miou and real_key not in self._real_conf_cache
+        conf_real = torch.zeros(SEG_NUM_CLASSES, SEG_NUM_CLASSES, dtype=torch.long)
+
         lpips_vals = []
         clip_prompt_vals = []
         clip_img_vals = []
@@ -171,7 +180,7 @@ class ControlNetEvaluator:
         generator = torch.Generator(device=self.device)
 
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Eval")):
-            generator.manual_seed(42 + batch_idx)  # deterministic → reproducible across runs
+            generator.manual_seed(config.EVAL_SEED + batch_idx)  # deterministic → reproducible across runs
 
             real_images = batch['image']      # (B, 3, H, W) in [-1, 1]
             mask_rgb    = batch['mask_rgb']
@@ -183,7 +192,7 @@ class ControlNetEvaluator:
 
             gen_pils = []
             for i in range(len(prompts)):
-                mask_np     = (mask_rgb[i].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                mask_np     = np.round(mask_rgb[i].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                 control_img = Image.fromarray(mask_np, mode='RGB')
                 gen = pipeline(
                     prompt=prompts[i],
@@ -191,10 +200,16 @@ class ControlNetEvaluator:
                     num_images_per_prompt=1,
                     num_inference_steps=num_inference_steps,
                     guidance_scale=config.GUIDANCE_SCALE,
+                    negative_prompt=config.NEGATIVE_PROMPT or None,
                     controlnet_conditioning_scale=control_strength,
                     generator=generator,
                 ).images[0]
                 gen_pils.append(gen)
+
+            if config.EVAL_SAVE_DIR:
+                save_dir = Path(config.EVAL_SAVE_DIR); save_dir.mkdir(parents=True, exist_ok=True)
+                for g, name in zip(gen_pils, batch['image_name']):
+                    g.save(save_dir / Path(name).with_suffix(".png").name)
 
             gen_uint8 = torch.stack(
                 [torch.from_numpy(np.array(g)).permute(2, 0, 1) for g in gen_pils]
@@ -215,6 +230,19 @@ class ControlNetEvaluator:
                 gen_01 = gen_uint8.float().to(self.device) / 255.0
                 lpips_vals.append(lpips(gen_01, real_01.to(self.device)).item())
 
+            # Segmentor mIoU (generated and real, same masks)
+            if use_miou:
+                target = batch['mask_seg'].to(self.device)
+                # one image at a time: the Mapillary judge (Swin-L at 1024 px) is large, and during training it
+                # shares the GPU with the model being trained
+                gen_01_all = gen_uint8.float().to(self.device) / 255.0
+                for j in range(gen_01_all.shape[0]):
+                    pred_gen = segmentor_logits(self.segmentor, gen_01_all[j:j + 1]).argmax(1)
+                    conf_gen += confusion_matrix(pred_gen, target[j:j + 1]).cpu()
+                    if need_real:
+                        pred_real = segmentor_logits(self.segmentor, real_01[j:j + 1].float().to(self.device)).argmax(1)
+                        conf_real += confusion_matrix(pred_real, target[j:j + 1]).cpu()
+
             # CLIP (image↔prompt, image↔GT)
             if CLIP_AVAILABLE and config.EVAL_CLIP:
                 real_pils = [Image.fromarray(r.permute(1, 2, 0).cpu().numpy()) for r in real_uint8]
@@ -225,26 +253,51 @@ class ControlNetEvaluator:
         results = {
             'fid': None, 'kid_mean': None, 'kid_std': None,
             'lpips': None, 'clip_prompt': None, 'clip_img': None,
+            'miou': None, 'pixel_acc': None, 'miou_real': None, 'pixel_acc_real': None,
         }
+        if use_miou:
+            if need_real:
+                self._real_conf_cache[real_key] = conf_real
+            conf_real = self._real_conf_cache[real_key]
+            results['miou'], results['pixel_acc'], per_class = miou_from_confusion(conf_gen)
+            results['miou_real'], results['pixel_acc_real'], _ = miou_from_confusion(conf_real)
+            results['iou_per_class'] = per_class
 
         if fid is not None:
             try:
                 results['fid'] = fid.compute().item()
             except RuntimeError:
                 print("FID skipped — need at least 2 samples.")
-        if kid is not None and n_samples >= config.EVAL_KID_SUBSET:
+        if kid is not None and n_samples > config.EVAL_KID_SUBSET:
             try:
-                km, ks = kid.compute()
+                # KID draws random subsets from the global RNG — fix it so the same images give the same number.
+                # fork_rng restores the CPU AND all CUDA generators afterwards. (The first version restored only
+                # the CPU generator; torch.manual_seed also resets CUDA, so the training epoch after every
+                # evaluation repeated the same noise and timesteps.)
+                cuda_devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+                with torch.random.fork_rng(devices=cuda_devices):
+                    torch.manual_seed(0)
+                    km, ks = kid.compute()
                 results['kid_mean'], results['kid_std'] = km.item(), ks.item()
             except (RuntimeError, ValueError) as e:
                 print(f"KID skipped — {e}")
         elif kid is not None:
-            print(f"KID skipped — need >= {config.EVAL_KID_SUBSET} samples (got {n_samples}).")
+            print(f"KID skipped — need > {config.EVAL_KID_SUBSET} samples (got {n_samples}).")
         if lpips_vals:
             results['lpips'] = float(np.mean(lpips_vals))
         if clip_prompt_vals:
             results['clip_prompt'] = float(np.mean(clip_prompt_vals))
             results['clip_img'] = float(np.mean(clip_img_vals))
+
+        # Free this call's metric models before returning. Without this, several evaluate() calls in one
+        # process (e.g. several control strengths) piled up Inception/LPIPS copies and ran a 10 GB GPU out
+        # of memory (guidance sweep, 2026-10-18).
+        del fid, kid, lpips
+        self.fid_metric = None
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         model.train()
         return results
