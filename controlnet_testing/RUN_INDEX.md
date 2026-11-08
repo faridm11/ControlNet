@@ -1,6 +1,6 @@
 # Run index
 
-Generated 2026-11-08 15:29 by `reporting/index_runs.py`. One row per training run; the run id is in every file name of that run (`logs/metrics_<run>.csv`, `logs/<run>_config.json`, `logs/<run>_final_eval.json`, `plots/<run>_*.png`, `samples/<run or job…>_epoch…/`, `checkpoints/<run>_LoRA.pt`). Runs on dataset 2 start with `sanpo_`.
+Generated 2026-11-08 15:53 by `reporting/index_runs.py`. One row per training run; the run id is in every file name of that run (`logs/metrics_<run>.csv`, `logs/<run>_config.json`, `logs/<run>_final_eval.json`, `plots/<run>_*.png`, `samples/<run or job…>_epoch…/`, `checkpoints/<run>_LoRA.pt`). Runs on dataset 2 start with `sanpo_`.
 
 Merged model copies (`<run>_Full/`, 1.4 GB each) of superseded runs were deleted on 2026-10-17 to save space; the LoRA file `<run>_LoRA.pt` is kept and rebuilds them (`src/models/diffusion_controlnet.py: load_checkpoint` + `create_pipeline`).
 
@@ -38,6 +38,9 @@ Merged model copies (`<run>_Full/`, 1.4 GB each) of superseded runs were deleted
 
 | Setting | Start weights | Real photos | Test mIoU per seed |
 |---|---|---|---|
+| imagenet_real_only_200 | imagenet | limited_200 | 0.620 / 0.621 / 0.627 |
+| imagenet_real_plus_base_200 | imagenet | limited_200 | 0.612 / 0.616 / 0.610 |
+| imagenet_real_plus_ours_200 | imagenet | limited_200 | 0.623 / 0.626 / 0.624 |
 | real_only | ade20k | limited_real | 0.623 / 0.624 / 0.616 |
 | real_only_200 | ade20k | limited_200 | 0.627 / 0.622 / 0.617 |
 | real_plus_base | ade20k | limited_real | 0.614 / 0.606 / 0.610 |

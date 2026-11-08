@@ -32,7 +32,8 @@ realistic. mIoU: how well the judge's reading of the image matches the input mas
 - Segmentation models trained on 200 or 300 real photos plus our generated images beat the same models trained with
   pretrained-ControlNet images on every seed (0.627 vs 0.610 with 300 photos, 0.604 vs 0.597 with 200).
 - They did not beat training on the real photos alone (300 photos: 0.627 vs 0.621, within noise; 200 photos: 0.604 vs 0.622).
-  200–300 real photos were already enough for an ADE20K-pretrained SegFormer.
+  200–300 real photos were already enough, even for a SegFormer starting from ImageNet weights (200 photos: real only 0.623,
+  + base images 0.613, + our images 0.625).
 
 ---
 

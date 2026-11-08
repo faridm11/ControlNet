@@ -1200,3 +1200,18 @@ Same 200 photos and 800 fakes per generator as the full final flow, but SegForme
 - RESULTS.docx rebuilt (`reporting/build_results_doc.py`) from valid runs only: protocol, hyperparameter screen (KID only), v1, v2/B, four seg-loss λ runs, the 200-photo generator, three-seed Mapillary table, ADE20K judge and white split, mapping check, downstream tests (300 photos, final flow, ImageNet start). Training-time mIoU of runs scored by the old judge is hidden. '±' is now the sample standard deviation (n−1) everywhere.
 - RUN_INDEX.md skips the archive and lists the step 20+ downstream results. `jobs/baseline_eval.sh` writes scratch output to `controlnet_testing/scratch_outputs/` (was the archived `step3_baseline/`).
 - This log keeps the full history, including archived results.
+
+### Step 25 results (2026-11-08)
+
+All three jobs completed (1868314-16). ImageNet-start SegFormer-B5, 200 real photos, tested on all 522 real test photos.
+
+| Setup | mIoU per seed | Mean ± SD (n-1) | Pixel acc |
+|---|---|---|---|
+| A: 200 real | 0.6201, 0.6209, 0.6273 | 0.623 ± 0.004 | 0.877 |
+| B: + 800 base | 0.6116, 0.6165, 0.6096 | 0.613 ± 0.004 | 0.871 |
+| C: + 800 ours | 0.6234, 0.6259, 0.6245 | 0.625 ± 0.001 | 0.876 |
+
+Same-seed differences: C-A +0.003/+0.005/-0.003; C-B +0.012/+0.009/+0.015. Per class A / B / C: road 0.631/0.559/0.568, fence/wall 0.523/0.544/0.569, vehicle 0.672/0.664/0.693, terrain 0.599/0.603/0.630, sign/light 0.136/0.117/0.120.
+
+- Without street-scene pretraining, 200 real photos still reach 0.623, the same as the ADE20K start (0.622).
+- Ours beats base on every seed again; ours vs real only is equal (+0.002, one seed lower). Road drops with any fakes; fence/wall, vehicle and terrain improve with ours.
